@@ -1,0 +1,55 @@
+{
+  "name": "pi-lmstudio-evict",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Pi extension for LM Studio: on /model switch it unloads the old model and preloads the new one, so only one model holds your VRAM. Reloads models evicted by idle TTL, covers what Auto-Evict misses, and keeps models.json in sync.",
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "pi-package",
+    "pi-extension",
+    "lmstudio",
+    "lm-studio",
+    "local-llm",
+    "local-models",
+    "llm",
+    "prewarm",
+    "model-loading",
+    "model-switch",
+    "vram",
+    "gpu",
+    "model-management"
+  ],
+  "author": "Marcin Wolny <marcin@marcinwolny.net>",
+  "license": "CC0-1.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MarcinWolnyEU/pi-lmstudio-evict.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MarcinWolnyEU/pi-lmstudio-evict/issues"
+  },
+  "homepage": "https://github.com/MarcinWolnyEU/pi-lmstudio-evict",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/evict.ts"
+    ]
+  },
+  "files": [
+    "extensions/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-reporter=spec \"tests/**/*.test.ts\"",
+    "test:unit": "node --test --test-concurrency=1 --test-reporter=spec \"tests/unit/*.test.ts\"",
+    "test:integration": "node --test --test-concurrency=1 --test-reporter=spec \"tests/integration/*.test.ts\"",
+    "typecheck": "node tests/typecheck.mjs"
+  }
+}
