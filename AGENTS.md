@@ -16,13 +16,17 @@ pi-lmstudio-evict/
 │   └── lib/
 │       ├── config.ts       settings + on-disk layout
 │       ├── lms.ts          `lms` CLI wrappers + the non-JSON parsers
+│       ├── loading.ts      picker loading indicator (BorderedLoader / footer status)
 │       ├── memory.ts       RAM/VRAM probes, size formatting, fit grading
 │       ├── orchestrator.ts evict-then-preload and heal sequences
 │       ├── registry.ts     models.json reconciliation
 │       └── sessions.ts     cross-process lock + session claims
 └── tests/
     ├── typecheck.mjs               ← discovers pi + @types/node at run time, then runs tsc
-    ├── unit/parsers.test.ts        pure functions, no LM Studio
+    ├── unit/
+    │   ├── parsers.test.ts         pure functions, no LM Studio
+    │   ├── find-pi.test.ts         managed-install discovery, version validation, launcher / PI_MANAGED_INSTALL_ROOT lookup
+    │   └── loading.test.ts         withLoader / withStatus against a fake pi context
     ├── support/
     │   ├── app-child.ts            headless stand-in for a pi session
     │   ├── barrier.ts              cross-process rendezvous (ordering, not sleeps)
@@ -39,7 +43,7 @@ pi-lmstudio-evict/
         └── estimate-guardrails.test.ts opt-in; edits LM Studio's own settings
 ```
 
-There is no build step; pi loads `.ts` directly via jiti. There are no `node_modules` and no npm dependencies — the code uses `node:` builtins and types from `@earendil-works/pi-coding-agent` (a peer dep, imported type-only so it is erased at runtime).
+There is no build step; pi loads `.ts` directly via jiti. There are no `node_modules` and no npm dependencies — the code uses `node:` builtins and types from `@earendil-works/pi-coding-agent` (a peer dep, imported type-only so it is erased at runtime — with one deliberate exception, the lazy `BorderedLoader` import in `lib/loading.ts`, described under "pi extension API" below).
 
 **Splitting into `lib/` is safe.** `resolveExtensionEntries()` in pi's package-manager reads `pi.extensions` from package.json and loads only what it lists, so sibling modules under `extensions/` are never picked up as separate extensions.
 
@@ -217,11 +221,17 @@ Honoured only when the owning PID is alive and `updatedAt` is within `CLAIM_STAL
 
 ## Tests
 
-`npm test`, or `test:unit` / `test:integration`. Node's built-in runner and type stripping — needs Node 22.18+ / 24+, no dependencies. `--test-concurrency=1` is essential: the integration tests share one LM Studio. A full green run is **71 passing, 1 skipped** (72 tests) (~3 minutes, most of it real model loads).
+`npm test`, or `test:unit` / `test:integration`. Node's built-in runner and type stripping — needs Node 22.18+ / 24+, no dependencies. `--test-concurrency=1` is essential: the integration tests share one LM Studio. A full green run is **85 passing, 1 skipped** (86 tests) (~3–7 minutes, most of it real model loads).
+
+**Known flake, cause identified: another client on the same LM Studio.** `multi-session.test.ts` › "heal fires through the real entry point…" passed in isolation and in file-only runs, but failed in three of five runs made while other agents were using the machine's LM Studio. The failures differed each time (a stray extra model and a duplicate `google/…` instance right after the load, a 237 s load instead of ~10 s, a model that reappeared during the 16 s cache-expiry sleep with no heal notification). The cause was another agent loading and unloading models that the test could not see; the test assumes nothing else touches LM Studio. If it fails, rerun it alone with `--test-name-pattern="heal fires"` with every other pi/LM Studio client closed before suspecting the lock; a persistent failure in that state is a real bug.
 
 The one skip is `estimate-guardrails.test.ts`, opt-in behind `PI_LMSTUDIO_EVICT_TEST_GUARDRAILS=1` because it edits LM Studio's *own* settings file to force the negative guardrail verdict. It backs up, restores in a `finally` **and** on `process.exit`, and asserts the restore was byte-identical. Run it before touching `parseEstimate`.
 
-`npm run typecheck` goes through `tests/typecheck.mjs` rather than `tsc -p` directly. `tsconfig.json` deliberately contains **no absolute paths**: pi and its bundled `@types/node` live somewhere different on every machine (next to the node binary on Windows/nvm4w, under `<prefix>/lib/node_modules` on Unix, anywhere at all with a custom npm prefix), so the script discovers them at run time — `tests/support/find-pi.ts`, falling back to `npm root -g` — and generates a tsconfig that extends the committed one. An earlier version hardcoded `C:/nvm4w/...` and failed on Linux.
+**A skipped or degraded pi-dependent test means `find-pi.ts` missed your layout, not that the test passed.** `extension-load` and `multi-session` skip with "pi not installed". `models-json` does *not* skip: its pi half falls back to a bare JSON-parse check and passes, leaving only the diagnostic line "falling back to a JSON parse check" — so a green `models-json` run proves nothing about pi's schema unless that line is absent. All of this happened silently on a managed install until the layout was added.
+
+`find-pi.ts` tries, in order: `./node_modules`, the managed install of the running launcher (`PI_MANAGED_INSTALL_ROOT`, which the launcher sets for the pi it spawns, then a `pi-launcher.js` directory on `PATH`), the npm-global layouts next to node, managed installs found by convention (`PI_CODING_AGENT_DIR`, `~/.pi/agent`), then `npm root -g`. The launcher goes ahead of the npm layouts so a stale global copy cannot shadow the install `pi` really runs, and it goes by `PATH` rather than the env var because the harness overwrites `PI_CODING_AGENT_DIR` with a temp dir. pi's dependencies (`jiti`, `@types/node`) may be hoisted beside pi rather than nested under it, so both spots are checked. `unit/find-pi.test.ts` plants real fake packages at every traversal target for `current-version`, so the validation is the only thing that can make those cases fail.
+
+`npm run typecheck` goes through `tests/typecheck.mjs` rather than `tsc -p` directly. `tsconfig.json` deliberately contains **no absolute paths**: pi and its bundled `@types/node` live somewhere different on every machine (next to the node binary on Windows/nvm4w, under `<prefix>/lib/node_modules` on Unix, anywhere at all with a custom npm prefix, or in pi's *managed install* at `<agent dir>/install/releases/<current-version>/node_modules` — the layout `pi.dev`'s installer creates, with no global npm package at all), so the script discovers them at run time — `tests/support/find-pi.ts`, falling back to `npm root -g` — and generates a tsconfig that extends the committed one. An earlier version hardcoded `C:/nvm4w/...` and failed on Linux.
 
 The integration suite **fails** rather than skips when LM Studio isn't usable; skipping would let a broken extension look tested. It discovers the two smallest non-embedding models from `lms ls` (nothing hardcoded, no assumed install path), unloads whatever was resident before starting, and times every step.
 
@@ -265,11 +275,13 @@ Events used:
 - `session_start` — `reason: "startup" | "reload" | "new" | "resume" | "fork"`
 - `session_shutdown` — `reason: "quit" | "reload" | "new" | "resume" | "fork"`
 
-`ctx` bits used: `ctx.model` (`provider`, `id`), `ctx.isIdle()`, `ctx.ui.*`, `ctx.modelRegistry.refresh()` (reloads models.json asynchronously — await it before synchronous registry reads).
+`ctx` bits used: `ctx.model` (`provider`, `id`), `ctx.mode` (`"tui" | "rpc" | "json" | "print"`; `ctx.ui.custom` only works in `"tui"`), `ctx.isIdle()`, `ctx.ui.*`, `ctx.modelRegistry.refresh()` (reloads models.json asynchronously — await it before synchronous registry reads).
 
 `ctx.ui.select()` returns the chosen **label**, so labels must be unique; the picker deduplicates with a `#n` suffix. Colors come from `ctx.ui.theme` — the `theme` singleton is not exported from the package root and the exports map blocks deep imports, so the UI context is the only sanctioned way to reach the live theme.
 
-The command name `/lmstudio-evict-model` contains "model" on purpose: the palette fuzzy-matches on command *names* only, and "model" is not a subsequence of "lmstudio-evict". Without the suffix the picker would be invisible while typing `/model`. **Don't shorten the name.**
+**Loading state in the picker.** The handler gathers `lms ps`/`ls`/VRAM/estimates inside `withLoader()` (in `lib/loading.ts`, so it can be unit-tested with a fake context), which shows pi's `BorderedLoader` through `ctx.ui.custom()` (cancellable; its `signal` stops `collectEstimates` pulling more work). `BorderedLoader` is exported from the package root and is a *runtime* import, the only one in the extension — hence the lazy `await import()` inside a `try`: pi is only a peer dependency, and `extension-load.test.ts` loads `evict.ts` with a bare jiti that has none of pi's virtual modules, so a static import could stop the module loading there (precaution; that test skips on machines where `find-pi.ts` can't locate pi). The lazy import was checked to resolve under pi's Node-mode jiti aliasing; the compiled-binary `virtualModules` mode has not been exercised. Outside `ctx.mode === "tui"` it uses the footer status; if the import fails *in* the TUI it does the same but raises a warning notification, so a broken import is visible instead of silently costing every picker its spinner. A rejection inside the gathering work is re-thrown after the loader closes, **not** treated as a cancel — Escape and failure both close the loader the same way, and swallowing the failure would leave a vanished spinner and no message. A rejection that arrives after Escape is dropped. Slow actions (load/unload/sync) use `withStatus()` for the footer line, on its own key (`COMMAND_STATUS_KEY`) so a picker action finishing cannot clear the "loading…" of a model switch made meanwhile. Escape stops queued estimates but not `lms` processes already running; those finish within their timeout and the results are dropped. Other loading primitives pi offers, not used: `ctx.ui.setWidget`, `setWorkingMessage`/`setWorkingIndicator` (those belong to the streaming loader, not commands).
+
+The picker is registered under four names (`COMMAND_NAMES` in `evict.ts`): `lmstudio-evict-model`, `llm-evict-model`, `model-load-unload`, `llm-load-unload`. pi has no alias feature; each name is a separate `registerCommand` call with the same options object. The palette fuzzy-matches on command *names* only, and "model" is not a subsequence of "lmstudio-evict", so the extra names are what make the picker visible while typing `/model`, `/llm`, `/load` or `/unload`. **Don't drop a name without checking the keywords it covers.** Both integration tests assert the exact list.
 
 ## Ideas not built
 

@@ -40,7 +40,8 @@ if (!piRoot || !nodeTypes) {
 		"Cannot typecheck: the pi package (and its bundled @types/node) was not found.\n" +
 			"Install it with:  npm i -g @earendil-works/pi-coding-agent\n" +
 			"or add it to this project:  npm i --no-save @earendil-works/pi-coding-agent\n" +
-			`(searched from node at ${process.execPath} and via \`npm root -g\`)`,
+			`(searched ./node_modules, a pi-launcher.js directory on PATH, ~/.pi/agent/install, ` +
+			`node at ${process.execPath}, and \`npm root -g\`)`,
 	);
 	process.exit(1);
 }

@@ -9,7 +9,8 @@
  *   session_start       sync models.json with LM Studio's catalogue
  *   session_shutdown    drop this session's claim
  *
- * `/lmstudio-evict-model` opens a picker over the catalogue for manual
+ * `/lmstudio-evict-model` (also `/llm-evict-model`, `/model-load-unload`,
+ * `/llm-load-unload`) opens a picker over the catalogue for manual
  * load/unload, shows what each model is and what it would cost, and holds
  * the settings.
  *
@@ -38,9 +39,11 @@ import {
 	lmsRun,
 	serverStatus,
 } from "./lib/lms.ts";
+import { CANCELLED, withLoader, withStatus } from "./lib/loading.ts";
 import { type Fit, fitOf, formatBytes, ram, vram } from "./lib/memory.ts";
 import {
 	bareModelKey,
+	duplicateIdentifiers,
 	evictThenPreload,
 	healIfEvicted,
 	isResident,
@@ -58,6 +61,9 @@ const PROVIDER_PREFIX = "lmstudio";
 
 /** Stable id for footer status lines. */
 const STATUS_KEY = "pi-lmstudio-evict";
+
+/** Every name the model picker answers to; the first is the canonical one. */
+const COMMAND_NAMES = ["lmstudio-evict-model", "llm-evict-model", "model-load-unload", "llm-load-unload"];
 
 /**
  * How long a "the model is resident" observation stays good enough to skip
@@ -250,11 +256,14 @@ export default function (pi: ExtensionAPI) {
 	/** Run `estimateMemory` over many models within a fixed time budget. */
 	const collectEstimates = async (
 		keys: string[],
+		signal?: AbortSignal,
 	): Promise<Map<string, MemoryEstimate | undefined>> => {
 		const results = new Map<string, MemoryEstimate | undefined>();
 		const queue = [...keys];
 		const worker = async () => {
 			for (;;) {
+				// A cancelled picker has no use for the remaining figures.
+				if (signal?.aborted) return;
 				const key = queue.shift();
 				if (key === undefined) return;
 				results.set(key, await estimateMemory(key));
@@ -295,18 +304,28 @@ export default function (pi: ExtensionAPI) {
 		description: "List LM Studio models, load/unload them, and manage eviction settings",
 		handler: async (_args: string, ctx: ExtensionCommandContext) => {
 			const config = loadResolvedConfig();
-			const [loaded, catalogRaw, gpu] = await Promise.all([listLoaded(), listCatalog(), vram()]);
-			if (!loaded) {
+
+			// Everything the picker needs is gathered behind a loader: `lms`
+			// round trips plus up to ESTIMATE_BUDGET_MS of estimates is long
+			// enough that a silent pause reads as a hang.
+			const gathered = await withLoader(ctx, "Reading LM Studio models…", async (signal) => {
+				const [loaded, catalogRaw, gpu] = await Promise.all([listLoaded(), listCatalog(), vram()]);
+				if (!loaded) return undefined;
+				const notLoaded = chatModels(catalogRaw ?? []).filter((m) => !isResident(loaded, m.modelKey));
+				const estimates = config.useMemoryEstimate
+					? await collectEstimates(
+							notLoaded.map((m) => m.modelKey),
+							signal,
+						)
+					: new Map<string, MemoryEstimate | undefined>();
+				return { loaded, notLoaded, gpu, estimates };
+			});
+			if (gathered === CANCELLED) return;
+			if (!gathered) {
 				ctx.ui.notify("Can't reach LM Studio — is `lms` on PATH and the server running?", "error");
 				return;
 			}
-
-			const catalog = chatModels(catalogRaw ?? []);
-			const notLoaded = catalog.filter((m) => !isResident(loaded, m.modelKey));
-
-			const estimates = config.useMemoryEstimate
-				? await collectEstimates(notLoaded.map((m) => m.modelKey))
-				: new Map<string, MemoryEstimate | undefined>();
+			const { loaded, notLoaded, gpu, estimates } = gathered;
 
 			const theme = ctx.ui.theme;
 			const ramPool = ram();
@@ -338,14 +357,20 @@ export default function (pi: ExtensionAPI) {
 				actions.set(unique, action);
 			};
 
+			const duplicates = duplicateIdentifiers(loaded);
 			for (const model of loaded) {
 				const ttl = model.ttlMs ? `, ttl ${Math.round(model.ttlMs / 60_000)}min` : "";
 				const info = describeModel(model, model);
+				const marker = duplicates.has(model.identifier)
+					? `${theme.fg("error", "●")} ${theme.fg("success", model.identifier)} ${theme.fg("error", "(DUPLICATE)")}`
+					: `● ${theme.fg("success", model.identifier)}`;
 				add(
-					`● ${theme.fg("success", model.identifier)} — ${formatBytes(model.sizeBytes)}${ttl}${info ? ` · ${info}` : ""} — unload`,
+					`${marker} — ${formatBytes(model.sizeBytes)}${ttl}${info ? ` · ${info}` : ""} — unload`,
 					async () => {
 						ctx.ui.notify(`Unloading ${model.identifier}…`, "info");
-						const ok = await lmsRun(["unload", model.identifier]);
+						const ok = await withStatus(ctx, `lmstudio: unloading ${model.identifier}…`, () =>
+							lmsRun(["unload", model.identifier]),
+						);
 						ctx.ui.notify(
 							ok ? `Unloaded ${model.identifier}` : `Failed to unload ${model.identifier}`,
 							ok ? "info" : "error",
@@ -357,7 +382,9 @@ export default function (pi: ExtensionAPI) {
 			if (loaded.length > 1) {
 				add(`●● unload all ${loaded.length} models`, async () => {
 					ctx.ui.notify(`Unloading ${loaded.length} models…`, "info");
-					const ok = await lmsRun(["unload", "--all"]);
+					const ok = await withStatus(ctx, `lmstudio: unloading ${loaded.length} models…`, () =>
+						lmsRun(["unload", "--all"]),
+					);
 					ctx.ui.notify(
 						ok ? `Unloaded ${loaded.length} models` : "Unload failed",
 						ok ? "info" : "error",
@@ -371,7 +398,9 @@ export default function (pi: ExtensionAPI) {
 					`○ ${model.modelKey} — ${sizeLabel(model.modelKey, model.sizeBytes)}${info ? ` · ${info}` : ""} — load`,
 					async () => {
 						ctx.ui.notify(`Loading ${model.modelKey} in the background…`, "info");
-						const ok = await lmsBackground(loadArgs(model.modelKey));
+						const ok = await withStatus(ctx, `lmstudio: loading ${model.modelKey}…`, () =>
+							lmsBackground(loadArgs(model.modelKey)),
+						);
 						ctx.ui.notify(
 							ok ? `Loaded ${model.modelKey}` : `Failed to load ${model.modelKey}`,
 							ok ? "info" : "error",
@@ -381,7 +410,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			add("⟳ Sync models.json with LM Studio now", async () => {
-				const [fresh, server] = await Promise.all([listCatalog(), serverStatus()]);
+				const [fresh, server] = await withStatus(ctx, "lmstudio: syncing models.json…", () =>
+					Promise.all([listCatalog(), serverStatus()]),
+				);
 				if (!fresh) {
 					ctx.ui.notify("Can't read the LM Studio catalogue", "error");
 					return;
@@ -522,9 +553,10 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	// The command palette fuzzy-matches on command *names* only; this name
-	// deliberately contains "model" so the picker shows up while typing "/model".
-	pi.registerCommand("lmstudio-evict-model", modelPicker);
+	// The command palette fuzzy-matches on command *names* only, so the picker is
+	// registered under every name people are likely to type: "model" and "llm"
+	// for what it manages, "load"/"unload" for what it does.
+	for (const name of COMMAND_NAMES) pi.registerCommand(name, modelPicker);
 }
 
 // Re-exported so the integration tests can exercise the same helpers the

@@ -40,6 +40,29 @@ export function matchesModelKey(entry: LoadedModel, modelKey: string): boolean {
 	return entry.identifier?.startsWith(`${modelKey}:`) === true;
 }
 
+/**
+ * Identifiers of extra copies: every entry after the first one listed for the
+ * same model. That is the copy `planEviction` would keep when the model is the
+ * target, so these are the ones it would reap — but it is a statement about
+ * list order, not about which copy is "the original". A second copy loaded on
+ * purpose under a custom `--identifier` counts too; the memory is spent twice
+ * either way.
+ *
+ * Entries without a `modelKey` are grouped by their identifier minus a
+ * trailing `:n`, which is narrower than `matchesModelKey`'s prefix test (that
+ * one has the target key to anchor on; here there is none).
+ */
+export function duplicateIdentifiers(loaded: LoadedModel[]): Set<string> {
+	const seen = new Set<string>();
+	const duplicates = new Set<string>();
+	for (const entry of loaded) {
+		const key = entry.modelKey ?? entry.identifier.replace(/:\d+$/, "");
+		if (seen.has(key)) duplicates.add(entry.identifier);
+		else seen.add(key);
+	}
+	return duplicates;
+}
+
 /** Is `modelKey` resident right now? */
 export function isResident(loaded: LoadedModel[], modelKey: string): boolean {
 	return loaded.some((entry) => matchesModelKey(entry, modelKey));

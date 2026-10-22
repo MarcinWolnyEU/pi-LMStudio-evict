@@ -13,7 +13,7 @@ import { test } from "node:test";
 import { loadArgs } from "../../extensions/lib/config.ts";
 import { type LoadedModel, parseEstimate, parseSizeBytes } from "../../extensions/lib/lms.ts";
 import { fitOf, formatBytes } from "../../extensions/lib/memory.ts";
-import { bareModelKey, isResident, matchesModelKey, planEviction } from "../../extensions/lib/orchestrator.ts";
+import { bareModelKey, duplicateIdentifiers, isResident, matchesModelKey, planEviction } from "../../extensions/lib/orchestrator.ts";
 
 const GIB = 1024 ** 3;
 
@@ -182,4 +182,22 @@ test("formatBytes: binary units, matching how lms reports memory", () => {
 	assert.equal(formatBytes(512 * 1024 ** 2), "512 MiB");
 	assert.equal(formatBytes(undefined), "size?");
 	assert.equal(formatBytes(Number.NaN), "size?");
+});
+
+test("duplicateIdentifiers flags only the surplus copies of a model", () => {
+	const none = duplicateIdentifiers([loaded("alpha", "alpha"), loaded("beta", "beta")]);
+	assert.equal(none.size, 0);
+
+	const twice = duplicateIdentifiers([loaded("alpha", "alpha"), loaded("alpha:2", "alpha"), loaded("beta", "beta")]);
+	assert.deepEqual([...twice], ["alpha:2"]);
+
+	// A custom --identifier is still a copy of the same modelKey.
+	const custom = duplicateIdentifiers([loaded("alpha", "alpha"), loaded("mine", "alpha"), loaded("alpha:3", "alpha")]);
+	assert.deepEqual([...custom], ["mine", "alpha:3"]);
+
+	// "Extra" is about list order, the same copy planEviction would keep for the target.
+	assert.deepEqual([...duplicateIdentifiers([loaded("alpha:2", "alpha"), loaded("alpha", "alpha")])], ["alpha"]);
+
+	// Entries without a modelKey fall back to the identifier minus its `:n` suffix.
+	assert.deepEqual([...duplicateIdentifiers([loaded("alpha"), loaded("alpha:2")])], ["alpha:2"]);
 });

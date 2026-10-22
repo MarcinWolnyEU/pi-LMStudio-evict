@@ -59,7 +59,7 @@ test("pi's jiti loader can import the extension and register its hooks", { timeo
 		assert.ok(hooks.includes(hook), `the extension should subscribe to ${hook}`);
 	}
 	// The palette matches on command names only, and "model" is not a
-	// subsequence of "lmstudio-evict" — without the suffix the picker is
-	// invisible while typing /model.
-	assert.deepEqual(commands, ["lmstudio-evict-model"]);
+	// subsequence of "lmstudio-evict" — without the aliases the picker is
+	// invisible while typing /model, /llm, /load or /unload.
+	assert.deepEqual(commands, ["lmstudio-evict-model", "llm-evict-model", "model-load-unload", "llm-load-unload"]);
 });

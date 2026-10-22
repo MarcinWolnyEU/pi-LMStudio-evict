@@ -61,7 +61,18 @@ function deadPid(): Promise<number> {
 	});
 }
 
+/**
+ * Stand in for pi's TUI, which is what normally keeps the process alive while
+ * a load is awaited. `evictThenPreload` waits on an `lms load` child that is
+ * unref'd on purpose, so without this the event loop empties mid-load and
+ * `node --test` cancels the test ("Promise resolution is still pending but the
+ * event loop has already resolved"), and every test after it with it.
+ * Same reason as the interval in support/app-child.ts.
+ */
+const keepAlive = setInterval(() => {}, 1000);
+
 after(() => {
+	clearInterval(keepAlive);
 	printTimingReport("LM Studio integration timings");
 	cleanupAgentDir();
 });

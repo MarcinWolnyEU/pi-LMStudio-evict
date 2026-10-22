@@ -111,7 +111,7 @@ Turn it off with `autoRegisterModels: false`.
 
 ## Commands
 
-`/lmstudio-evict-model` opens a picker over LM Studio's model catalogue. The name contains "model" on purpose: pi's command palette matches on names, so it shows up while you're typing `/model`.
+`/lmstudio-evict-model` opens a picker over LM Studio's model catalogue. The same picker is also available as `/llm-evict-model`, `/model-load-unload` and `/llm-load-unload`: pi's command palette matches on names, so it shows up whichever of `/model`, `/llm`, `/load` or `/unload` you start typing.
 
 ```
 LM Studio models — RAM 41.2 GiB free of 63.9 GiB · VRAM 9.8 GiB free of 24.0 GiB
@@ -183,7 +183,7 @@ npm run typecheck
 
 The integration tests fail, rather than skip, when LM Studio isn't running or has fewer than two chat models, so a green run means the behaviour was exercised. They redirect `PI_CODING_AGENT_DIR` to a temporary directory, so your own config and `models.json` are never touched. They do leave LM Studio with no models loaded.
 
-A full run is 72 tests and takes a few minutes, most of it real model loads. What they cover:
+A full run is 86 tests and takes a few minutes, most of it real model loads. What they cover:
 
 | Area | How it's tested |
 |---|---|
@@ -193,7 +193,7 @@ A full run is 72 tests and takes a few minutes, most of it real model loads. Wha
 | `models.json` policy | Synthetic catalogues for the ownership rules, then the real catalogue validated by pi's own schema loader |
 | Extension loading | Imported through pi's bundled jiti, the way pi does it |
 
-One test is opt-in and reports itself as skipped unless you enable it: the negative guardrail verdict ("this model will fail to load based on your resource guardrails settings"). LM Studio only produces that verdict from its own guardrail setting, which lives in the desktop app's settings file and can't be set from the CLI, so the test temporarily edits that file (backed up first, restored in `finally` and again on process exit, and asserted byte-identical). Nothing else in the suite touches LM Studio's configuration, which is why this one asks for consent. To run all 72 with nothing skipped:
+One test is opt-in and reports itself as skipped unless you enable it: the negative guardrail verdict ("this model will fail to load based on your resource guardrails settings"). LM Studio only produces that verdict from its own guardrail setting, which lives in the desktop app's settings file and can't be set from the CLI, so the test temporarily edits that file (backed up first, restored in `finally` and again on process exit, and asserted byte-identical). Nothing else in the suite touches LM Studio's configuration, which is why this one asks for consent. To run all 86 with nothing skipped:
 
 ```bash
 PI_LMSTUDIO_EVICT_TEST_GUARDRAILS=1 npm test          # bash

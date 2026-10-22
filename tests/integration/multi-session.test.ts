@@ -213,7 +213,12 @@ test("app-child: the harness loads the real extension", { timeout: 120_000 }, as
 		["before_agent_start", "model_select", "session_shutdown", "session_start"],
 		"the child must register the same hooks pi would",
 	);
-	assert.deepEqual(report.commands, ["lmstudio-evict-model"]);
+	assert.deepEqual(report.commands, [
+		"lmstudio-evict-model",
+		"llm-evict-model",
+		"model-load-unload",
+		"llm-load-unload",
+	]);
 });
 
 test(
