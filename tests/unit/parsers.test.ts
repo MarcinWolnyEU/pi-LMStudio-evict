@@ -9,11 +9,22 @@
  */
 
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { test } from "node:test";
-import { loadArgs } from "../../extensions/lib/config.ts";
+import { contextLengthFor, loadArgs } from "../../extensions/lib/config.ts";
 import { type LoadedModel, parseEstimate, parseSizeBytes } from "../../extensions/lib/lms.ts";
 import { fitOf, formatBytes } from "../../extensions/lib/memory.ts";
-import { bareModelKey, duplicateIdentifiers, isResident, matchesModelKey, planEviction } from "../../extensions/lib/orchestrator.ts";
+import {
+	bareModelKey,
+	duplicateIdentifiers,
+	hasWrongContext,
+	isResident,
+	isUsable,
+	matchesModelKey,
+	planEviction,
+} from "../../extensions/lib/orchestrator.ts";
 
 const GIB = 1024 ** 3;
 
@@ -152,6 +163,93 @@ test("planEviction: surplus copies of the target are unloaded, one is kept", () 
 	assert.equal(plan.targetResident, true);
 });
 
+/** A resident copy loaded at `contextLength`, used once unless `used` is false. */
+function sized(identifier: string, contextLength: number, used = true): LoadedModel {
+	return { identifier, modelKey: identifier.replace(/:\d+$/, ""), contextLength, lastUsedTime: used ? 1 : null };
+}
+
+test("hasWrongContext: compares only when a context is wanted and known", () => {
+	assert.equal(hasWrongContext(sized("alpha", 4096), undefined), false);
+	assert.equal(hasWrongContext(loaded("alpha", "alpha"), 32768), false, "no contextLength reported");
+	assert.equal(hasWrongContext(sized("alpha", 32768), 32768), false);
+	assert.equal(hasWrongContext(sized("alpha", 4096), 32768), true);
+	assert.equal(hasWrongContext(sized("alpha", 65536), 32768), true, "too big is wrong too: it costs memory");
+});
+
+test("hasWrongContext: the 8192 a loading model reports is not taken at face value", () => {
+	// Mid-load, lms ps shows 8192 whatever the load asked for (AGENTS.md).
+	// Treating that as wrong would unload every load in flight.
+	assert.equal(hasWrongContext(sized("alpha", 8192, false), 32768), false);
+	// Once the model has served a request it has finished loading, so 8192 is
+	// real — the just-in-time-load-at-the-default case this exists to fix.
+	assert.equal(hasWrongContext(sized("alpha", 8192, true), 32768), true);
+});
+
+test("isUsable: resident at the wanted context, or resident with nothing wanted", () => {
+	assert.equal(isUsable([sized("alpha", 4096)], "alpha", undefined), true);
+	assert.equal(isUsable([sized("alpha", 4096)], "alpha", 32768), false);
+	assert.equal(isUsable([sized("alpha", 4096), sized("alpha:2", 32768)], "alpha", 32768), true);
+	assert.equal(isUsable([sized("beta", 32768)], "alpha", 32768), false);
+});
+
+test("planEviction: a target copy at the wrong context is unloaded and reloaded", () => {
+	const plan = planEviction([sized("alpha", 4096), sized("beta", 32768)], "alpha", new Set(), 32768);
+
+	assert.deepEqual(plan.keep, []);
+	assert.deepEqual(plan.victims.map((m) => m.identifier), ["alpha", "beta"]);
+	assert.equal(plan.targetResident, false, "the caller must load it again");
+});
+
+test("planEviction: keeps the copy at the right context and reaps the rest", () => {
+	const plan = planEviction([sized("alpha", 4096), sized("alpha:2", 32768)], "alpha", new Set(), 32768);
+
+	assert.deepEqual(plan.keep.map((m) => m.identifier), ["alpha:2"]);
+	assert.deepEqual(plan.victims.map((m) => m.identifier), ["alpha"]);
+	assert.equal(plan.targetResident, true);
+});
+
+test("planEviction: a wrong-context copy another session claimed is left alone", () => {
+	const plan = planEviction([sized("alpha", 4096)], "alpha", new Set(["alpha"]), 32768);
+
+	assert.deepEqual(plan.keep.map((m) => m.identifier), ["alpha"]);
+	assert.deepEqual(plan.victims, []);
+	assert.equal(plan.targetResident, true, "and not loaded a second time beside it");
+});
+
+test("contextLengthFor: hand-written contextWindow, then the global setting, then nothing", (t) => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "evict-ctx-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const modelsPath = path.join(dir, "models.json");
+	fs.writeFileSync(
+		modelsPath,
+		JSON.stringify({
+			providers: {
+				lmstudio: {
+					models: [
+						{ id: "hand", contextWindow: 32768 },
+						{ id: "managed", contextWindow: 262144, managedBy: "pi-lmstudio-evict" },
+						{ id: "broken", contextWindow: "lots" },
+					],
+				},
+				"lmstudio/desktop": { models: [{ id: "remote", contextWindow: 16384 }] },
+				openai: { models: [{ id: "elsewhere", contextWindow: 999 }] },
+			},
+		}),
+	);
+
+	assert.equal(contextLengthFor("hand", {}, modelsPath), 32768);
+	assert.equal(contextLengthFor("remote", {}, modelsPath), 16384, "any lmstudio* provider");
+	// A generated entry carries the model's maximum; loading at that could
+	// need more memory than the machine has.
+	assert.equal(contextLengthFor("managed", {}, modelsPath), undefined);
+	assert.equal(contextLengthFor("managed", { contextLength: 16384 }, modelsPath), 16384);
+	assert.equal(contextLengthFor("broken", { contextLength: 8192 }, modelsPath), 8192);
+	assert.equal(contextLengthFor("elsewhere", {}, modelsPath), undefined, "only LM Studio providers");
+	assert.equal(contextLengthFor("hand", { contextLength: 4096 }, modelsPath), 32768, "per-model wins");
+	assert.equal(contextLengthFor("hand", { matchContextWindow: false, contextLength: 4096 }, modelsPath), 4096);
+	assert.equal(contextLengthFor("hand", { contextLength: 0 }, path.join(dir, "missing.json")), undefined);
+});
+
 test("loadArgs: always scripts non-interactively, and only sets a TTL when configured", () => {
 	assert.deepEqual(loadArgs("alpha", {}), ["load", "alpha", "--yes"]);
 	assert.deepEqual(loadArgs("alpha", { ttlSeconds: 900 }), ["load", "alpha", "--yes", "--ttl", "900"]);
@@ -159,6 +257,22 @@ test("loadArgs: always scripts non-interactively, and only sets a TTL when confi
 	assert.deepEqual(loadArgs("alpha", { ttlSeconds: 0 }), ["load", "alpha", "--yes"]);
 	assert.deepEqual(loadArgs("alpha", { ttlSeconds: -5 }), ["load", "alpha", "--yes"]);
 	assert.deepEqual(loadArgs("alpha", { ttlSeconds: 12.7 }), ["load", "alpha", "--yes", "--ttl", "12"]);
+});
+
+test("loadArgs: passes a context length only when it is a positive number", () => {
+	assert.deepEqual(loadArgs("alpha", {}, 32768), ["load", "alpha", "--yes", "--context-length", "32768"]);
+	assert.deepEqual(loadArgs("alpha", { ttlSeconds: 900 }, 32768), [
+		"load",
+		"alpha",
+		"--yes",
+		"--ttl",
+		"900",
+		"--context-length",
+		"32768",
+	]);
+	assert.deepEqual(loadArgs("alpha", {}, undefined), ["load", "alpha", "--yes"]);
+	assert.deepEqual(loadArgs("alpha", {}, 0), ["load", "alpha", "--yes"]);
+	assert.deepEqual(loadArgs("alpha", {}, Number.NaN), ["load", "alpha", "--yes"]);
 });
 
 test("fitOf: grades a model against free RAM and VRAM", () => {

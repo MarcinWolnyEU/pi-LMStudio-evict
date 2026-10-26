@@ -22,6 +22,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	type EvictConfig,
+	contextLengthFor,
 	loadArgs,
 	loadConfig,
 	loadResolvedConfig,
@@ -241,7 +242,10 @@ export default function (pi: ExtensionAPI) {
 			// Undefined means the cap expired; the model may still be loading.
 			if (!outcome?.checked || !outcome.ok) return;
 			residentAt = Date.now();
-			if (outcome.reloaded) {
+			if (outcome.reloaded && outcome.wrongContext) {
+				const context = contextLengthFor(modelKey, config);
+				ctx.ui.notify(`${modelKey} was loaded at the wrong context — reloaded it at ${context}`, "info");
+			} else if (outcome.reloaded) {
 				ctx.ui.notify(`LM Studio had evicted ${modelKey} — reloaded it`, "info");
 			}
 		} catch {
@@ -399,7 +403,7 @@ export default function (pi: ExtensionAPI) {
 					async () => {
 						ctx.ui.notify(`Loading ${model.modelKey} in the background…`, "info");
 						const ok = await withStatus(ctx, `lmstudio: loading ${model.modelKey}…`, () =>
-							lmsBackground(loadArgs(model.modelKey)),
+							lmsBackground(loadArgs(model.modelKey, loadConfig(), contextLengthFor(model.modelKey))),
 						);
 						ctx.ui.notify(
 							ok ? `Loaded ${model.modelKey}` : `Failed to load ${model.modelKey}`,
@@ -507,6 +511,39 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`TTL set — idle models unload after ${seconds}s`, "info");
 				},
 			},
+			{
+				label: config.contextLength
+					? `Context length: ${config.contextLength} tokens`
+					: "Context length: LM Studio's default",
+				apply: async () => {
+					const stored = loadConfig();
+					const raw = await ctx.ui.input(
+						"Context length to load models with, in tokens (empty or 0 = LM Studio's default)",
+						stored.contextLength ? String(stored.contextLength) : "",
+					);
+					if (raw === undefined) return;
+					const trimmed = raw.trim();
+					if (trimmed === "" || trimmed === "0" || trimmed === "off") {
+						delete stored.contextLength;
+						saveConfig(stored);
+						ctx.ui.notify("Context length off — LM Studio picks its default", "info");
+						return;
+					}
+					const length = Number.parseInt(trimmed, 10);
+					if (!Number.isFinite(length) || length <= 0) {
+						ctx.ui.notify(`Not a valid context length: ${trimmed}`, "error");
+						return;
+					}
+					stored.contextLength = length;
+					saveConfig(stored);
+					ctx.ui.notify(`Context length set — models load at ${length} tokens`, "info");
+				},
+			},
+			toggle(
+				ctx,
+				"matchContextWindow",
+				`Match contextWindow: ${onOff(config.matchContextWindow)} — load at a hand-written models.json window`,
+			),
 			toggle(
 				ctx,
 				"healEvictions",
@@ -538,7 +575,12 @@ export default function (pi: ExtensionAPI) {
 	/** A boolean setting rendered as one flip-on-select menu entry. */
 	function toggle(
 		ctx: ExtensionCommandContext,
-		key: "healEvictions" | "multiSessionSafety" | "autoRegisterModels" | "useMemoryEstimate",
+		key:
+			| "healEvictions"
+			| "multiSessionSafety"
+			| "autoRegisterModels"
+			| "useMemoryEstimate"
+			| "matchContextWindow",
 		label: string,
 	): { label: string; apply: () => void } {
 		return {

@@ -8,7 +8,7 @@
  * real sequences rather than a re-implementation of them.
  */
 
-import { type ResolvedConfig, loadArgs, loadResolvedConfig } from "./config.ts";
+import { type ResolvedConfig, contextLengthFor, loadArgs, loadResolvedConfig } from "./config.ts";
 import { type LoadedModel, listLoaded, lmsBackground, unload, unloadAll } from "./lms.ts";
 import {
 	type AcquireOptions,
@@ -69,6 +69,33 @@ export function isResident(loaded: LoadedModel[], modelKey: string): boolean {
 }
 
 /**
+ * What `lms ps` reports as `contextLength` for a model that is still loading,
+ * before it settles to the real value (see AGENTS.md).
+ */
+export const LOADING_PLACEHOLDER_CONTEXT = 8192;
+
+/**
+ * Is this resident copy loaded at a different context than we want?
+ *
+ * The placeholder is the trap: a model that is mid-load reports 8192 whatever
+ * it is being loaded with, so a naive comparison would unload every load in
+ * flight. A placeholder value only counts as real once the model has served a
+ * request (`lastUsedTime`), which a loading model cannot have done. The cost
+ * is that a model fully loaded at exactly 8192 and never used is left alone
+ * until its first turn — the next turn then fixes it.
+ */
+export function hasWrongContext(entry: LoadedModel, contextLength: number | undefined): boolean {
+	if (contextLength === undefined || entry.contextLength === undefined) return false;
+	if (entry.contextLength === contextLength) return false;
+	return !(entry.contextLength === LOADING_PLACEHOLDER_CONTEXT && entry.lastUsedTime == null);
+}
+
+/** Is `modelKey` resident at a context we can use? */
+export function isUsable(loaded: LoadedModel[], modelKey: string, contextLength: number | undefined): boolean {
+	return loaded.some((entry) => matchesModelKey(entry, modelKey) && !hasWrongContext(entry, contextLength));
+}
+
+/**
  * Decide which loaded models to unload.
  *
  * Kept: one instance of the target (loading it again would give LM Studio a
@@ -76,16 +103,23 @@ export function isResident(loaded: LoadedModel[], modelKey: string): boolean {
  * failure this extension exists to prevent), plus everything another live pi
  * session has claimed. Everything else goes, including surplus copies of the
  * target itself.
+ *
+ * With a `contextLength`, a target copy loaded at a different context is not
+ * worth keeping: it goes, and the target is reloaded at the right size. The
+ * unload has to come first for the same `key:2` reason. A copy another
+ * session has claimed is kept as it is — that session is using it.
  */
 export function planEviction(
 	loaded: LoadedModel[],
 	modelKey: string,
 	protectedKeys: ReadonlySet<string>,
+	contextLength?: number,
 ): { keep: LoadedModel[]; victims: LoadedModel[]; targetResident: boolean } {
 	const keepIdentifiers = new Set<string>();
 
 	const targetInstances = loaded.filter((entry) => matchesModelKey(entry, modelKey));
-	if (targetInstances[0]) keepIdentifiers.add(targetInstances[0].identifier);
+	const usable = targetInstances.find((entry) => !hasWrongContext(entry, contextLength));
+	if (usable) keepIdentifiers.add(usable.identifier);
 
 	for (const entry of loaded) {
 		const key = entry.modelKey ?? entry.identifier;
@@ -95,7 +129,7 @@ export function planEviction(
 	return {
 		keep: loaded.filter((entry) => keepIdentifiers.has(entry.identifier)),
 		victims: loaded.filter((entry) => !keepIdentifiers.has(entry.identifier)),
-		targetResident: targetInstances.length > 0,
+		targetResident: targetInstances.some((entry) => keepIdentifiers.has(entry.identifier)),
 	};
 }
 
@@ -105,6 +139,8 @@ export interface EvictOptions {
 	modelKey: string;
 	sessionId: string;
 	config?: ResolvedConfig;
+	/** Context to load at. Defaults to `contextLengthFor(modelKey, config)`. */
+	contextLength?: number;
 	lock?: AcquireOptions;
 	onProgress?: (phase: EvictPhase, detail?: string) => void;
 }
@@ -139,6 +175,7 @@ export async function evictThenPreload(options: EvictOptions): Promise<EvictOutc
 	const started = Date.now();
 	const config = options.config ?? loadResolvedConfig();
 	const { modelKey, sessionId } = options;
+	const contextLength = options.contextLength ?? contextLengthFor(modelKey, config);
 	const progress = options.onProgress ?? (() => {});
 
 	return withLock(async (locked, handle): Promise<EvictOutcome> => {
@@ -159,7 +196,7 @@ export async function evictThenPreload(options: EvictOptions): Promise<EvictOutc
 		if (!loaded) {
 			await unloadAll();
 			progress("loading", modelKey);
-			const ok = await lmsBackground(loadArgs(modelKey, config));
+			const ok = await lmsBackground(loadArgs(modelKey, config, contextLength));
 			progress("done");
 			return {
 				locked,
@@ -171,7 +208,7 @@ export async function evictThenPreload(options: EvictOptions): Promise<EvictOutc
 			};
 		}
 
-		const { keep, victims, targetResident } = planEviction(loaded, modelKey, protectedKeys);
+		const { keep, victims, targetResident } = planEviction(loaded, modelKey, protectedKeys, contextLength);
 		const unloaded: string[] = [];
 
 		// Last check before anything destructive. A lock can be taken from us
@@ -206,7 +243,7 @@ export async function evictThenPreload(options: EvictOptions): Promise<EvictOutc
 		let loadedOk = false;
 		if (!targetResident) {
 			progress("loading", modelKey);
-			loadedOk = await lmsBackground(loadArgs(modelKey, config));
+			loadedOk = await lmsBackground(loadArgs(modelKey, config, contextLength));
 		}
 
 		progress("done");
@@ -225,6 +262,8 @@ export interface HealOptions {
 	modelKey: string;
 	sessionId: string;
 	config?: ResolvedConfig;
+	/** Context the model must be loaded at. Defaults to `contextLengthFor(modelKey, config)`. */
+	contextLength?: number;
 	lock?: AcquireOptions;
 	onProgress?: (phase: "checking" | "loading" | "done") => void;
 }
@@ -234,6 +273,12 @@ export interface HealOutcome {
 	checked: boolean;
 	/** True when the model was found missing from memory. */
 	wasEvicted: boolean;
+	/**
+	 * True when the model was resident but at the wrong context length. It is
+	 * reloaded unless another live session has claimed it (then `reloaded`
+	 * stays false and the copy is left as it is).
+	 */
+	wrongContext?: boolean;
 	/** True when this call issued the reload (false if another session beat us). */
 	reloaded: boolean;
 	/** False when the reload was attempted and failed. */
@@ -249,11 +294,16 @@ export interface HealOutcome {
  * Deliberately narrow — it reloads the target and nothing else. Evicting
  * strangers here would mean surprise unloads at prompt time; the next model
  * switch applies the full policy.
+ *
+ * The one unload it does is of the target itself, when it is resident at the
+ * wrong context length (typically a just-in-time load at LM Studio's small
+ * default). Reloading without unloading first would leave a `key:2` copy.
  */
 export async function healIfEvicted(options: HealOptions): Promise<HealOutcome> {
 	const started = Date.now();
 	const config = options.config ?? loadResolvedConfig();
-	const { modelKey } = options;
+	const { modelKey, sessionId } = options;
+	const contextLength = options.contextLength ?? contextLengthFor(modelKey, config);
 	const progress = options.onProgress ?? (() => {});
 
 	progress("checking");
@@ -261,23 +311,54 @@ export async function healIfEvicted(options: HealOptions): Promise<HealOutcome> 
 	if (!loaded) {
 		return { checked: false, wasEvicted: false, reloaded: false, ok: false, durationMs: Date.now() - started };
 	}
-	if (isResident(loaded, modelKey)) {
+	if (isUsable(loaded, modelKey, contextLength)) {
 		return { checked: true, wasEvicted: false, reloaded: false, ok: true, durationMs: Date.now() - started };
 	}
 
-	return withLock(async (): Promise<HealOutcome> => {
+	return withLock(async (_locked, handle): Promise<HealOutcome> => {
 		// Re-check inside the lock: another session (or a switch that was
-		// already in flight) may have loaded it while we queued.
+		// already in flight) may have loaded it while we queued. Loads this
+		// extension starts run under the lock, so any of ours have settled by
+		// now and their context is real.
 		const current = await listLoaded();
-		if (current && isResident(current, modelKey)) {
+		if (current && isUsable(current, modelKey, contextLength)) {
 			return { checked: true, wasEvicted: true, reloaded: false, ok: true, durationMs: Date.now() - started };
 		}
+
+		const stale = (current ?? []).filter(
+			(entry) => matchesModelKey(entry, modelKey) && hasWrongContext(entry, contextLength),
+		);
+		const wrongContext = stale.length > 0;
+		if (wrongContext) {
+			const claimed = config.multiSessionSafety ? claimedByOthers(sessionId) : new Set<string>();
+			// Another session is using this copy as it is, or the lock was taken
+			// from us: unloading now could cut off a response. Leave it.
+			if (claimed.has(modelKey) || (handle && !handle.isValid())) {
+				return {
+					checked: true,
+					wasEvicted: false,
+					wrongContext,
+					reloaded: false,
+					ok: true,
+					durationMs: Date.now() - started,
+				};
+			}
+			for (const entry of stale) await unload(entry.identifier);
+		}
+
 		progress("loading");
 		// `keepAlive` because this is awaited and the caller acts on the
 		// result: the turn is being held open for it. Without it the host can
 		// exit the instant its event loop empties, mid-load.
-		const ok = await lmsBackground(loadArgs(modelKey, config), { keepAlive: true });
+		const ok = await lmsBackground(loadArgs(modelKey, config, contextLength), { keepAlive: true });
 		progress("done");
-		return { checked: true, wasEvicted: true, reloaded: true, ok, durationMs: Date.now() - started };
+		return {
+			checked: true,
+			wasEvicted: !wrongContext,
+			wrongContext,
+			reloaded: true,
+			ok,
+			durationMs: Date.now() - started,
+		};
 	}, options.lock);
 }
