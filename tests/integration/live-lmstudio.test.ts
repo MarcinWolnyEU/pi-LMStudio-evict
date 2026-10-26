@@ -29,9 +29,24 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { after, test } from "node:test";
 import { DEFAULTS } from "../../extensions/lib/config.ts";
-import { estimateMemory, listLoaded, lmsBinary, unload } from "../../extensions/lib/lms.ts";
+import {
+	estimateMemory,
+	listLoaded,
+	lmsBinary,
+	lmsRun,
+	serverStatus,
+	stopServer,
+	unload,
+} from "../../extensions/lib/lms.ts";
 import { formatBytes } from "../../extensions/lib/memory.ts";
-import { evictThenPreload, healIfEvicted, isResident } from "../../extensions/lib/orchestrator.ts";
+import {
+	ensureServer,
+	evictThenPreload,
+	healIfEvicted,
+	isResident,
+	matchesModelKey,
+	releaseOnQuit,
+} from "../../extensions/lib/orchestrator.ts";
 import { type SessionClaim, isProcessAlive, sessionsDir } from "../../extensions/lib/sessions.ts";
 
 /** This suite's stand-in for a pi session. */
@@ -361,6 +376,180 @@ test(
 		);
 	},
 );
+
+/** The resident copies of `modelKey`, as `identifier@contextLength`. */
+async function copiesOf(modelKey: string): Promise<string[]> {
+	return ((await listLoaded()) ?? [])
+		.filter((entry) => matchesModelKey(entry, modelKey))
+		.map((entry) => `${entry.identifier}@${entry.contextLength}`);
+}
+
+test("context: a preload uses the configured context length", { timeout: LONG_TIMEOUT_MS }, async (t) => {
+	const { small } = await preflight();
+	const target = small[0].modelKey;
+	await resetLmStudio();
+
+	const outcome = await timed(t, "evictThenPreload at 16384", () =>
+		evictThenPreload({ modelKey: target, sessionId: SESSION, contextLength: 16_384 }),
+	);
+
+	assert.equal(outcome.loaded, true);
+	assert.deepEqual(await copiesOf(target), [`${target}@16384`]);
+});
+
+test("context: heal replaces a copy loaded at the wrong context", { timeout: LONG_TIMEOUT_MS }, async (t) => {
+	const { small } = await preflight();
+	const target = small[0].modelKey;
+	await resetLmStudio();
+	// What a just-in-time load at LM Studio's default looks like to us.
+	assert.ok(await lmsRun(["load", target, "--yes", "--context-length", "4096"]), "setup load failed");
+
+	const outcome = await timed(t, "heal from 4096 to 16384", () =>
+		healIfEvicted({ modelKey: target, sessionId: SESSION, contextLength: 16_384 }),
+	);
+
+	assert.equal(outcome.wrongContext, true);
+	assert.equal(outcome.reloaded, true);
+	assert.equal(outcome.ok, true);
+	assert.deepEqual(
+		await copiesOf(target),
+		[`${target}@16384`],
+		"exactly one copy, at the new context — a ':2' means it reloaded before unloading",
+	);
+});
+
+test(
+	"context: heal leaves a wrong-context copy that another live session claims",
+	{ timeout: LONG_TIMEOUT_MS },
+	async () => {
+		const { small } = await preflight();
+		const target = small[0].modelKey;
+		// Resident at 16384 from the previous test.
+		writeForeignClaim(OTHER_SESSION, target, process.pid);
+		try {
+			const outcome = await healIfEvicted({ modelKey: target, sessionId: SESSION, contextLength: 4096 });
+			assert.equal(outcome.wrongContext, true);
+			assert.equal(outcome.reloaded, false, "the other session is using it as it is");
+		} finally {
+			dropForeignClaim(OTHER_SESSION);
+		}
+		assert.deepEqual(await copiesOf(target), [`${target}@16384`]);
+	},
+);
+
+test(
+	"context: a copy that is still loading is not unloaded for its context",
+	{ timeout: LONG_TIMEOUT_MS },
+	async (t) => {
+		const { small } = await preflight();
+		const target = small[0].modelKey;
+		await resetLmStudio();
+
+		// An external load at a different context, caught in flight.
+		const loader = spawn(lmsBinary(), ["load", target, "--yes", "--context-length", "4096"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		let loaderDone = false;
+		const loaderExit = new Promise<void>((resolve) => {
+			loader.once("exit", () => {
+				loaderDone = true;
+				resolve();
+			});
+		});
+		try {
+			const deadline = Date.now() + 60_000;
+			while (!isResident((await listLoaded()) ?? [], target)) {
+				if (Date.now() > deadline) throw new Error(`${target} never appeared in lms ps`);
+				await new Promise((resolve) => setTimeout(resolve, 120));
+			}
+			if (loaderDone) t.diagnostic("NOTE: the load finished before we observed it; the race was not exercised");
+
+			const outcome = await healIfEvicted({ modelKey: target, sessionId: SESSION, contextLength: 16_384 });
+			if (!loaderDone) {
+				assert.equal(outcome.reloaded, false, "a loading copy must be left to finish");
+			}
+		} finally {
+			await loaderExit;
+		}
+		assert.equal((await copiesOf(target)).length, 1, "no duplicate either way");
+	},
+);
+
+test("extra load args: reach lms, and a bad one fails the load", { timeout: LONG_TIMEOUT_MS }, async (t) => {
+	const { small } = await preflight();
+	const target = small[0].modelKey;
+	await resetLmStudio();
+
+	const good = await timed(t, "preload with --parallel 2", () =>
+		evictThenPreload({
+			modelKey: target,
+			sessionId: SESSION,
+			config: { ...DEFAULTS, extraLoadArgs: ["--parallel", "2", "--context-length", "999"] },
+			contextLength: 16_384,
+		}),
+	);
+	assert.equal(good.loaded, true);
+	const entry = ((await listLoaded()) ?? []).find((e) => matchesModelKey(e, target)) as
+		| { parallel?: number; contextLength?: number }
+		| undefined;
+	assert.equal(entry?.parallel, 2, "--parallel reached lms");
+	assert.equal(entry?.contextLength, 16_384, "a user --context-length is dropped, ours wins");
+
+	await resetLmStudio();
+	const bad = await evictThenPreload({
+		modelKey: target,
+		sessionId: SESSION,
+		config: { ...DEFAULTS, extraLoadArgs: ["--definitely-not-a-flag"] },
+	});
+	assert.equal(bad.loaded, false, "lms rejects unknown flags, and the outcome says so");
+});
+
+test("quit: spares a claimed model, unloads an unclaimed one", { timeout: LONG_TIMEOUT_MS }, async () => {
+	const { small } = await preflight();
+	const target = small[0].modelKey;
+	await resetLmStudio();
+	assert.ok(await lmsRun(["load", target, "--yes"]), "setup load failed");
+	const config = { ...DEFAULTS, unloadOnQuit: true };
+
+	writeForeignClaim(OTHER_SESSION, target, process.pid);
+	try {
+		const spared = await releaseOnQuit({ modelKey: target, sessionId: SESSION, config });
+		assert.equal(spared.spared, true);
+		assert.equal((await copiesOf(target)).length, 1);
+	} finally {
+		dropForeignClaim(OTHER_SESSION);
+	}
+
+	const released = await releaseOnQuit({ modelKey: target, sessionId: SESSION, config });
+	assert.equal(released.spared, false);
+	assert.deepEqual(await copiesOf(target), [], "unloaded once no one else claims it");
+
+	const off = await releaseOnQuit({ modelKey: target, sessionId: SESSION, config: DEFAULTS });
+	assert.deepEqual(off.unloaded, [], "nothing happens with the settings off");
+});
+
+test("server: ensureServer starts a stopped server, and only when asked", { timeout: 180_000 }, async (t) => {
+	const before = await serverStatus();
+	assert.ok(before, "lms server status must answer");
+	try {
+		assert.ok(await stopServer(), "stop failed");
+		assert.equal((await serverStatus())?.running, false);
+
+		assert.equal(await ensureServer({ config: DEFAULTS }), undefined, "off by default");
+		assert.equal((await serverStatus())?.running, false);
+
+		const started = await timed(t, "ensureServer from stopped", () =>
+			ensureServer({ config: { ...DEFAULTS, startServer: true } }),
+		);
+		assert.equal(started, true);
+		assert.equal((await serverStatus())?.running, true);
+		assert.equal(await ensureServer({ config: { ...DEFAULTS, startServer: true } }), false, "already up");
+	} finally {
+		// Leave the server as the suite found it.
+		if (before.running && !(await serverStatus())?.running) await lmsRun(["server", "start"]);
+	}
+});
 
 test("teardown: LM Studio is left empty", { timeout: LONG_TIMEOUT_MS }, async (t) => {
 	const started = Date.now();

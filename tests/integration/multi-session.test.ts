@@ -36,6 +36,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { saveConfig } from "../../extensions/lib/config.ts";
 import { unloadAll } from "../../extensions/lib/lms.ts";
 import { sessionsDir } from "../../extensions/lib/sessions.ts";
 import { resetBarriers, signal } from "../support/barrier.ts";
@@ -403,6 +404,48 @@ test(
 			report.notifications?.some((n) => n.includes("evicted") && n.includes(target)),
 			`the user should have been told the model was reloaded; got: ${report.notifications?.join(" | ")}`,
 		);
+	},
+);
+
+test(
+	"unloadOnQuit: the last session to quit unloads the model, not the first",
+	{ timeout: LONG_TIMEOUT_MS },
+	async (t) => {
+		if (!findJitiEntry()) return t.skip("pi not installed");
+		const { small } = await preflight();
+		const target = small[0].modelKey;
+		await resetLmStudio();
+		// Children share this agent dir, so they read the same config.
+		saveConfig({ unloadOnQuit: true });
+		t.after(() => saveConfig({}));
+		const ws = workspace();
+		t.after(() => releaseAll(ws));
+
+		const a = runChild("A", ws, [
+			{ op: "session_start" },
+			{ op: "model_select", model: target },
+			{ op: "signal", name: "a.ready" },
+			{ op: "wait", name: "a.quit" },
+			{ op: "session_shutdown" },
+		]);
+		const b = runChild("B", ws, [
+			{ op: "session_start" },
+			{ op: "wait", name: "a.ready" },
+			{ op: "model_select", model: target },
+			{ op: "signal", name: "b.ready" },
+			{ op: "wait", name: "b.quit" },
+			{ op: "session_shutdown" },
+		]);
+		await timed(t, "both sessions on the same model", () => awaitBarrier(ws, "b.ready"));
+		assert.deepEqual(await residentKeys(), [target]);
+
+		signal(ws.barriers, "a.quit");
+		assert.equal((await a).error, undefined);
+		assert.deepEqual(await residentKeys(), [target], "B still claims it, so A's quit must spare it");
+
+		signal(ws.barriers, "b.quit");
+		assert.equal((await b).error, undefined);
+		assert.deepEqual(await residentKeys(), [], "the last session out unloads it");
 	},
 );
 

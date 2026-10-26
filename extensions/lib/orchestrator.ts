@@ -79,25 +79,22 @@ export function isResident(loaded: LoadedModel[], modelKey: string): boolean {
 }
 
 /**
- * What `lms ps` reports as `contextLength` for a model that is still loading,
- * before it settles to the real value (see AGENTS.md).
- */
-export const LOADING_PLACEHOLDER_CONTEXT = 8192;
-
-/**
  * Is this resident copy loaded at a different context than we want?
  *
- * The placeholder is the trap: a model that is mid-load reports 8192 whatever
- * it is being loaded with, so a naive comparison would unload every load in
- * flight. A placeholder value only counts as real once the model has served a
- * request (`lastUsedTime`), which a loading model cannot have done. The cost
- * is that a model fully loaded at exactly 8192 and never used is left alone
- * until its first turn — the next turn then fixes it.
+ * Only judged once the copy has finished loading, because a copy that is
+ * still loading must never be unloaded from under its load. `lastUsedTime` is
+ * the signal: it stays null for the whole load and is set when the load
+ * completes (LM Studio 0.4.x; on 0.3.x it stayed null until the first request).
+ * The `contextLength` of a loading copy is no help — 0.3.x reported a
+ * placeholder 8192 there, 0.4.x reports the requested value (see AGENTS.md).
+ *
+ * The cost, on 0.3.x only: a copy loaded at the wrong context and never used
+ * is left alone until its first turn; the next turn then fixes it.
  */
 export function hasWrongContext(entry: LoadedModel, contextLength: number | undefined): boolean {
 	if (contextLength === undefined || entry.contextLength === undefined) return false;
-	if (entry.contextLength === contextLength) return false;
-	return !(entry.contextLength === LOADING_PLACEHOLDER_CONTEXT && entry.lastUsedTime == null);
+	if (entry.lastUsedTime == null) return false;
+	return entry.contextLength !== contextLength;
 }
 
 /** Is `modelKey` resident at a context we can use? */
