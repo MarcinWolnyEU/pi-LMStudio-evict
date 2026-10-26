@@ -26,6 +26,8 @@ export interface LoadedModel {
 	ttlMs?: number | null;
 	contextLength?: number;
 	maxContextLength?: number;
+	/** Epoch ms of the last request served; null until the model is first used. */
+	lastUsedTime?: number | null;
 	paramsString?: string;
 	architecture?: string;
 	quantization?: { name?: string; bits?: number };

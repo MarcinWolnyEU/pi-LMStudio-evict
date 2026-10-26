@@ -15,6 +15,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type ModelsJson, isManaged } from "./registry.ts";
 
 export interface EvictConfig {
 	/**
@@ -47,14 +48,30 @@ export interface EvictConfig {
 	 * call per listed model, so it can be turned off on huge catalogues.
 	 */
 	useMemoryEstimate?: boolean;
+	/**
+	 * Context length to load models with (`lms load --context-length`), for
+	 * models without a hand-written `contextWindow` (see `matchContextWindow`).
+	 * Absent: LM Studio picks its per-model default, which is often far below
+	 * what pi assumes and surfaces as "tokens to keep … greater than the
+	 * context length" on the first long prompt.
+	 */
+	contextLength?: number;
+	/**
+	 * Load a model at the `contextWindow` of its hand-written `models.json`
+	 * entry, so LM Studio really serves the window pi budgets for. Entries this
+	 * extension generated are skipped: theirs is the model's *maximum*
+	 * context, which can be 256k and more than the machine can hold.
+	 */
+	matchContextWindow?: boolean;
 }
 
 /** Applied wherever the config file leaves a field out. */
-export const DEFAULTS: Required<Omit<EvictConfig, "ttlSeconds">> = {
+export const DEFAULTS: Required<Omit<EvictConfig, "ttlSeconds" | "contextLength">> = {
 	healEvictions: true,
 	multiSessionSafety: true,
 	autoRegisterModels: true,
 	useMemoryEstimate: true,
+	matchContextWindow: true,
 };
 
 export type ResolvedConfig = EvictConfig & typeof DEFAULTS;
@@ -108,6 +125,41 @@ export function saveConfig(config: EvictConfig): void {
 	fs.writeFileSync(configPath(), `${JSON.stringify(config, null, "\t")}\n`, "utf-8");
 }
 
+/** A positive whole number of tokens, or undefined. */
+function tokens(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+}
+
+/**
+ * The context length `modelKey` should be loaded with, or undefined to leave
+ * it to LM Studio. A hand-written `contextWindow` under any `lmstudio*`
+ * provider wins (when `matchContextWindow` is on), then the global
+ * `contextLength`.
+ *
+ * Read fresh from disk on every call, like the rest of the config; an
+ * unreadable `models.json` just means "no per-model value".
+ */
+export function contextLengthFor(
+	modelKey: string,
+	config: EvictConfig = loadConfig(),
+	modelsPath: string = modelsJsonPath(),
+): number | undefined {
+	if (config.matchContextWindow ?? DEFAULTS.matchContextWindow) {
+		try {
+			const models = JSON.parse(fs.readFileSync(modelsPath, "utf-8")) as ModelsJson;
+			for (const [provider, block] of Object.entries(models?.providers ?? {})) {
+				if (!provider.startsWith("lmstudio")) continue;
+				const entry = block?.models?.find((m) => m?.id === modelKey && !isManaged(m));
+				const window = tokens(entry?.contextWindow);
+				if (window) return window;
+			}
+		} catch {
+			// Missing or malformed models.json — fall through to the global value.
+		}
+	}
+	return tokens(config.contextLength);
+}
+
 /**
  * Arguments for `lms load`. `--yes` keeps an ambiguous model key from
  * dropping `lms` into its interactive picker, which would hang a child with
@@ -116,13 +168,17 @@ export function saveConfig(config: EvictConfig): void {
  * idle time.
  *
  * The TTL is read fresh on every call, so a change made in the picker
- * applies to the next load without a reload.
+ * applies to the next load without a reload. The context length is passed in
+ * rather than looked up here, so this stays a pure function of its inputs;
+ * callers get it from `contextLengthFor()`.
  */
-export function loadArgs(modelKey: string, config: EvictConfig = loadConfig()): string[] {
+export function loadArgs(modelKey: string, config: EvictConfig = loadConfig(), contextLength?: number): string[] {
 	const args = ["load", modelKey, "--yes"];
 	const ttl = config.ttlSeconds;
 	if (typeof ttl === "number" && Number.isFinite(ttl) && ttl > 0) {
 		args.push("--ttl", String(Math.floor(ttl)));
 	}
+	const context = tokens(contextLength);
+	if (context) args.push("--context-length", String(context));
 	return args;
 }
