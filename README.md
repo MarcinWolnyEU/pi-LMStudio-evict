@@ -55,8 +55,8 @@ Then `/reload` in pi, or restart it.
 ## Requirements
 
 - pi (`@earendil-works/pi-coding-agent`, declared as a peer dependency)
-- LM Studio with the local server running
-- `lms` CLI on `PATH` (ships with LM Studio; on Windows: `C:\Users\<you>\.lmstudio\bin\lms.exe`)
+- LM Studio, with the local server running (or `startServer: true`)
+- The `lms` CLI (ships with LM Studio). Found on `PATH`, else in LM Studio's own `~/.lmstudio/bin`, so a pi started from a GUI launcher or non-login shell still finds it; set `LMS_PATH` to point somewhere else
 - A pi provider for LM Studio, for example [`pi-lmstudio`](https://www.npmjs.com/package/pi-lmstudio) or a hand-written `lmstudio` block in `~/.pi/agent/models.json`
 
 ## Behavior
@@ -67,15 +67,17 @@ Then `/reload` in pi, or restart it.
 | `Ctrl+P` cycling to a different LM Studio model | Same |
 | `--model lmstudio/...` on the command line | Same |
 | Prompt sent while the active model is no longer loaded | Reload it first (see **Healing**) |
-| Session start | Sync `models.json` with LM Studio's catalogue |
+| Prompt sent while the active model is loaded at the wrong context | Unload it, then reload it at the right one (see **Context length**) |
+| Session start | Sync `models.json` with LM Studio's catalogue; start the server if `startServer` is on |
+| pi quits normally | Unload this session's model if `unloadOnQuit` is on and no other live session claims it; stop the server if `stopServerOnQuit` is on and this was the last session |
 | Session restore picking an LM Studio model | No-op (would force a redundant reload) |
 | Reselecting the same model | No-op, and never a second copy (see below) |
 | Switching to a non-LM-Studio model (Anthropic, OpenRouter, etc.) | No-op, and this session stops claiming a model |
-| `lms` missing or local server down | No-op, silent |
+| `lms` missing, or local server down with `startServer` off | No-op, silent |
 
 The switch itself is fire-and-forget. It runs in the background, so pi never blocks on a model load, and progress appears in the footer. The load starts only after the unload has finished; otherwise two large models could sit in memory at once.
 
-By default the preload sets no TTL: the model is pinned and stays loaded until the next switch. If you'd rather have idle models unload themselves, set a TTL in the settings menu.
+By default the preload sets no TTL: the model is pinned and stays loaded until the next switch. If you'd rather have idle models unload themselves, set a TTL in the settings menu. A TTL is also the only thing that unloads a model after pi is hard-killed: `unloadOnQuit` needs a normal quit to run.
 
 There is never a second copy. `lms load` on an already-loaded model does not no-op: LM Studio loads a *second* instance under `<key>:2` and doubles the memory. The extension checks what's loaded before every load, and reaps surplus copies if it finds them.
 
@@ -86,6 +88,18 @@ Before each turn, the extension checks that the active model is still loaded and
 The check is one `lms ps` call (about 0.5 s) and is skipped when the model was confirmed loaded in the last 15 seconds, so rapid back-and-forth prompting doesn't pay for it. When a reload is needed the turn waits for it, capped at 5 minutes, after which the prompt goes through and LM Studio just-in-time loads the model itself.
 
 Turn it off with `healEvictions: false`.
+
+## Context length
+
+LM Studio loads a model at its own per-model default unless told otherwise, and that is often far below what pi budgets for. The symptom is an error on the first long prompt: "The number of tokens to keep from the initial prompt is greater than the context length".
+
+Every load this extension performs can pass `--context-length`. The value comes from, in order:
+
+1. the `contextWindow` of a **hand-written** `models.json` entry for that model (any `lmstudio*` provider), when `matchContextWindow` is on. pi then really gets the window it budgets for. Generated entries are skipped: theirs is the model's *maximum* context, which can be 256k and more than the machine can hold;
+2. the global `contextLength` setting;
+3. nothing: LM Studio's default, as before.
+
+A model already loaded at a different context (typically a just-in-time load at the default) is unloaded and reloaded at the right one: by the heal before a turn, and by a model switch. It is unloaded **first**, so there is never a `<key>:2` copy. A copy is left alone when another live session claims it, and while it is still loading, so a load in flight is never cut off.
 
 ## Multiple pi sessions
 
@@ -125,7 +139,7 @@ LM Studio models — RAM 41.2 GiB free of 63.9 GiB · VRAM 9.8 GiB free of 24.0 
 - `●` loaded models (name in green): select one to unload it. An "unload all" entry appears when more than one is loaded.
 - `○` on-disk models: select one to load it in the background. Embedding models are hidden.
 - `⟳` reconciles `models.json` now, without waiting for the next session start.
-- `⚙` opens the settings: TTL and the four toggles below. The menu stays open after each change so several can be flipped in one visit. Escape returns to the model list, and Escape there closes the picker.
+- `⚙` opens the settings: TTL, context length, extra load flags, and the toggles below. The menu stays open after each change so several can be flipped in one visit. Escape returns to the model list, and Escape there closes the picker.
 
 Each row shows what the model is: parameters, quantization, architecture, vision and tool support, and context length (current/max for loaded models).
 
@@ -144,6 +158,13 @@ Settings live in `<agent dir>/extensions/pi-lmstudio-evict/config.json` (usually
 ```json
 {
   "ttlSeconds": 900,
+  "contextLength": 32768,
+  "matchContextWindow": true,
+  "extraLoadArgs": ["--gpu", "max"],
+  "modelLoadArgs": { "qwen/qwen3.5-9b": ["--parallel", "2"] },
+  "startServer": true,
+  "unloadOnQuit": true,
+  "stopServerOnQuit": false,
   "healEvictions": true,
   "multiSessionSafety": true,
   "autoRegisterModels": true,
@@ -158,6 +179,13 @@ Settings live in `<agent dir>/extensions/pi-lmstudio-evict/config.json` (usually
 | `multiSessionSafety` | `true` | Spare models other live pi sessions have claimed instead of unloading everything. |
 | `autoRegisterModels` | `true` | Keep `models.json` in step with LM Studio's catalogue. |
 | `useMemoryEstimate` | `true` | Size models in the picker via `lms load --estimate-only` instead of file size. |
+| `contextLength` | *(unset)* | Passed as `--context-length` to every load, for models without a hand-written `contextWindow`. See **Context length**. |
+| `matchContextWindow` | `true` | Load at the `contextWindow` of a hand-written `models.json` entry. |
+| `extraLoadArgs` | *(unset)* | Extra `lms load` flags for every load, e.g. `["--gpu", "max", "--parallel", "2", "--speculative-draft-mtp"]`. See `lms load --help` for what your LM Studio supports; an unknown flag makes the load fail. Flags the extension sets itself (`--context-length`/`-c`, `--ttl`, `--identifier`, `--yes`/`-y`, `--estimate-only`) are dropped. |
+| `modelLoadArgs` | *(unset)* | Per-model extra flags, keyed by model key; added after `extraLoadArgs`. Config file only. |
+| `startServer` | `false` | Run `lms server start` when an LM Studio model is in use and the server is down: on session start, before a switch, and before the heal check. |
+| `unloadOnQuit` | `false` | On a normal quit, unload this session's model unless another live session claims it. |
+| `stopServerOnQuit` | `false` | On a normal quit, stop the server when no other pi session is alive. Other apps may use it, so think before turning it on. |
 
 Everything is read fresh, so a change applies to the next operation without a reload.
 
@@ -183,7 +211,7 @@ npm run typecheck
 
 The integration tests fail, rather than skip, when LM Studio isn't running or has fewer than two chat models, so a green run means the behaviour was exercised. They redirect `PI_CODING_AGENT_DIR` to a temporary directory, so your own config and `models.json` are never touched. They do leave LM Studio with no models loaded.
 
-A full run is 86 tests and takes a few minutes, most of it real model loads. What they cover:
+A full run is 109 tests and takes a few minutes, most of it real model loads. What they cover:
 
 | Area | How it's tested |
 |---|---|
@@ -193,7 +221,7 @@ A full run is 86 tests and takes a few minutes, most of it real model loads. Wha
 | `models.json` policy | Synthetic catalogues for the ownership rules, then the real catalogue validated by pi's own schema loader |
 | Extension loading | Imported through pi's bundled jiti, the way pi does it |
 
-One test is opt-in and reports itself as skipped unless you enable it: the negative guardrail verdict ("this model will fail to load based on your resource guardrails settings"). LM Studio only produces that verdict from its own guardrail setting, which lives in the desktop app's settings file and can't be set from the CLI, so the test temporarily edits that file (backed up first, restored in `finally` and again on process exit, and asserted byte-identical). Nothing else in the suite touches LM Studio's configuration, which is why this one asks for consent. To run all 86 with nothing skipped:
+One test is opt-in and reports itself as skipped unless you enable it: the negative guardrail verdict ("this model will fail to load based on your resource guardrails settings"). LM Studio only produces that verdict from its own guardrail setting, which lives in the desktop app's settings file and can't be set from the CLI, so the test temporarily edits that file (backed up first, restored in `finally` and again on process exit, and asserted byte-identical). Nothing else in the suite touches LM Studio's configuration, which is why this one asks for consent. To run all 109 with nothing skipped:
 
 ```bash
 PI_LMSTUDIO_EVICT_TEST_GUARDRAILS=1 npm test          # bash

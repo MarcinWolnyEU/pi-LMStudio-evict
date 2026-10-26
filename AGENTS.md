@@ -53,10 +53,10 @@ There is no build step; pi loads `.ts` directly via jiti. There are no `node_mod
 
 | Event | What happens |
 |---|---|
-| `session_start` | Prune dead claims, write this session's claim, reconcile `models.json`, `modelRegistry.refresh()` |
-| `model_select` | Update the claim; unless restore / same-model / mid-stream, run `evictThenPreload` in a floating task |
-| `before_agent_start` | Heal: if the active model is no longer resident, reload it **before** the turn proceeds |
-| `session_shutdown` | Drop this session's claim |
+| `session_start` | Prune dead claims, write this session's claim, `ensureServer` (when on an LM Studio model), reconcile `models.json`, `modelRegistry.refresh()` |
+| `model_select` | Update the claim; unless restore / same-model / mid-stream, run `ensureServer` then `evictThenPreload` in a floating task |
+| `before_agent_start` | Past the residency cache: `ensureServer`, then heal — if the active model is not resident at the wanted context, (unload and) reload it **before** the turn proceeds |
+| `session_shutdown` | Drop this session's claim; on `reason: "quit"` only, `releaseOnQuit` |
 
 `before_agent_start` is the right hook for healing because pi **awaits** its handlers (`emitBeforeAgentStart` in `dist/core/extensions/runner.js` awaits each one), so the reload finishes before the provider request goes out. `turn_start` is not awaited in the same useful way and fires mid-agent-loop.
 
@@ -67,7 +67,20 @@ Both take the cross-process lock, and both are exported so the integration tests
 - `evictThenPreload({ modelKey, sessionId })` — plan the eviction, unload the victims, then load the target if it isn't already resident. Strictly sequenced: loading before the unload finishes would briefly hold two models, or let `unload --all` kill the load in flight.
 - `healIfEvicted({ modelKey, sessionId })` — cheap `lms ps` check; if the model is gone, take the lock, **re-check** (another session may have loaded it while we queued), then load. Deliberately narrow: it reloads the target and evicts nothing, because surprise unloads at prompt time are worse than a stray resident model. The next switch applies the full policy.
 
-`planEviction()` is pure and is where the policy lives: keep one instance of the target, keep everything another live session claimed, unload the rest (including surplus copies of the target).
+`planEviction()` is pure and is where the policy lives: keep one instance of the target, keep everything another live session claimed, unload the rest (including surplus copies of the target). Given a `contextLength`, the instance kept must be at that context; a target copy at another context becomes a victim (unless claimed), and the target is reloaded.
+
+Two smaller sequences, both opt-in and both under the lock with a short `timeoutMs` (the body runs anyway past it):
+
+- `ensureServer()` — `lms server start` when `startServer` is on and `lms server status` says it is down; re-checks inside the lock. `lms ps`/`load` work without the server, pi's requests do not.
+- `releaseOnQuit()` — on a real quit, unload this session's model unless another live session claims it (`unloadOnQuit`), and stop the server if no other pi session is alive (`stopServerOnQuit`). Not on `/new`, `/resume`, `/fork` or reload: the process carries on and would only load the model again.
+
+### Context length
+
+`contextLengthFor(modelKey, config)` (config.ts) decides the `--context-length`: a hand-written `contextWindow` under any `lmstudio*` provider in `models.json` (when `matchContextWindow`), then `contextLength`, else none. Generated entries are skipped on purpose — `toModelEntry` writes the model's *maximum* context there, and loading a 262k window blindly can exhaust memory. `loadArgs` takes the value as a parameter so it stays pure; the orchestrator resolves it.
+
+`hasWrongContext()` decides whether a resident copy must be replaced. It refuses to judge a copy whose `lastUsedTime` is null, because that copy may still be loading (see the measurement below), and unloading it would cut the load off.
+
+`extraArgsFor()` appends `extraLoadArgs` and `modelLoadArgs[key]`, minus the flags the extension owns (`OWNED_FLAGS`): a user `--context-length` would defeat `hasWrongContext`, `--identifier` would break `matchesModelKey` and with it the `key:2` guard.
 
 ### Configuration
 
@@ -76,6 +89,13 @@ Both take the cross-process lock, and both are exported so the integration tests
 ```json
 {
   "ttlSeconds": 900,
+  "contextLength": 32768,
+  "matchContextWindow": true,
+  "extraLoadArgs": ["--gpu", "max"],
+  "modelLoadArgs": { "qwen/qwen3.5-9b": ["--parallel", "2"] },
+  "startServer": false,
+  "unloadOnQuit": false,
+  "stopServerOnQuit": false,
   "healEvictions": true,
   "multiSessionSafety": true,
   "autoRegisterModels": true,
@@ -166,6 +186,12 @@ This is exactly what we want. A chat completion sent to a mid-load model returns
 
 The one visible artefact: the picker can momentarily render `ctx 8192/262144` for a model that is still loading. Cosmetic — don't trust `contextLength` from an entry that only just appeared.
 
+**LM Studio 0.4.25 (macOS) behaves differently**, measured by polling `lms ps --json` every 0.3 s through a `lms load -c 16384`: the entry appeared ~0.6 s in, reported `contextLength: 16384` (the *requested* value, no placeholder) for the whole load, and `lastUsedTime` stayed `null` until the instant the load completed, when it was set. So on 0.4.x `lastUsedTime == null` means "still loading", while on 0.3.x it meant "loading or never used". `hasWrongContext()` keys on it for that reason: on either version it never judges a copy that might be mid-load.
+
+### `lms ps --json` reports `parallel`
+
+Measured on 0.4.25: a model loaded with `--parallel 2` lists `"parallel": 2`, which is how the integration test proves `extraLoadArgs` reach `lms`. An unknown `lms load` flag exits 1, so a typo in `extraLoadArgs` shows up as a failed load.
+
 ### `models.json` tolerates extra keys
 
 pi's schema (`ModelsConfigSchema` in `dist/core/model-config.js`) is a TypeBox object without `additionalProperties: false`, so `"managedBy": "pi-lmstudio-evict"` round-trips fine. Verified by running pi's own `ModelConfig.load()` over a generated file — the integration test still does this on every run, so a future schema tightening will be caught.
@@ -221,7 +247,7 @@ Honoured only when the owning PID is alive and `updatedAt` is within `CLAIM_STAL
 
 ## Tests
 
-`npm test`, or `test:unit` / `test:integration`. Node's built-in runner and type stripping — needs Node 22.18+ / 24+, no dependencies. `--test-concurrency=1` is essential: the integration tests share one LM Studio. A full green run is **85 passing, 1 skipped** (86 tests) (~3–7 minutes, most of it real model loads).
+`npm test`, or `test:unit` / `test:integration`. Node's built-in runner and type stripping — needs Node 22.18+ / 24+, no dependencies. `--test-concurrency=1` is essential: the integration tests share one LM Studio. A full green run is **108 passing, 1 skipped** (109 tests) (~3–7 minutes, most of it real model loads).
 
 **Known flake, cause identified: another client on the same LM Studio.** `multi-session.test.ts` › "heal fires through the real entry point…" passed in isolation and in file-only runs, but failed in three of five runs made while other agents were using the machine's LM Studio. The failures differed each time (a stray extra model and a duplicate `google/…` instance right after the load, a 237 s load instead of ~10 s, a model that reappeared during the 16 s cache-expiry sleep with no heal notification). The cause was another agent loading and unloading models that the test could not see; the test assumes nothing else touches LM Studio. If it fails, rerun it alone with `--test-name-pattern="heal fires"` with every other pi/LM Studio client closed before suspecting the lock; a persistent failure in that state is a real bug.
 
@@ -285,14 +311,12 @@ The picker is registered under four names (`COMMAND_NAMES` in `evict.ts`): `lmst
 
 ## Ideas not built
 
-- **Load with the right context length.** `lms load --context-length N` exists and `event.model.contextWindow` is available. Would fix LM Studio loading a coder model at its small default. Not done: interacts with the residency check (a resident model loaded at the wrong context would need an unload/reload to fix, which conflicts with "never reload what's already there").
 - **Passive footer widget** listing what's in memory. `ctx.ui.setStatus` is already used for transient progress; a permanent line would need a refresh policy.
 - **RAM-pressure LRU eviction** with a protect-list, as `lm-studio-warm-core` does, instead of "one model at a time".
 - **Broader VRAM sources** — AMD via `rocm-smi`, Apple Silicon unified memory as one pool. Today `memory.ts` degrades to RAM-only off NVIDIA.
-- **Optional unload on exit** via `session_shutdown`, off by default.
 
 ## Other notes
 
-- **Cross-platform:** the only OS-specific bits are `windowsHide: true` in the spawn options (don't remove it; LM Studio on Windows spawns a console window otherwise) and `nvidia-smi` being NVIDIA-only.
+- **Cross-platform:** the only OS-specific bits are `windowsHide: true` in the spawn options (don't remove it; LM Studio on Windows spawns a console window otherwise), `nvidia-smi` being NVIDIA-only, and `lmsBinary()`'s fallback to `~/.lmstudio/bin` — on macOS a pi started outside a login shell (GUI launcher, IDE) has no `lms` on `PATH`, and every automatic path would silently no-op. Always spawn through `lmsBinary()`, never a bare `"lms"`.
 - **Logging:** there is none. If you add diagnostics use `console.log`; pi surfaces extension logs in `--verbose`. The extension is supposed to be invisible, so keep it quiet.
 - **Beware invisible characters in source.** `lms.ts` builds its regexes with `new RegExp` from `\u` escapes precisely because literal ESC/NBSP/thin-space characters get mangled by tooling. Keep it that way.
