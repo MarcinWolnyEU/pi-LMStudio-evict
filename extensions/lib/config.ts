@@ -78,6 +78,17 @@ export interface EvictConfig {
 	 * server is a bigger step than loading a model, so it is opt-in.
 	 */
 	startServer?: boolean;
+	/**
+	 * When pi quits normally, unload the model this session was using, unless
+	 * another live pi session claims it. A hard kill runs no code at all; set
+	 * `ttlSeconds` as the backstop for that case.
+	 */
+	unloadOnQuit?: boolean;
+	/**
+	 * When pi quits normally and no other live pi session remains, stop LM
+	 * Studio's local server too. Other apps may be using it, so off by default.
+	 */
+	stopServerOnQuit?: boolean;
 }
 
 /** Applied wherever the config file leaves a field out. */
@@ -90,6 +101,8 @@ export const DEFAULTS: Required<
 	useMemoryEstimate: true,
 	matchContextWindow: true,
 	startServer: false,
+	unloadOnQuit: false,
+	stopServerOnQuit: false,
 };
 
 export type ResolvedConfig = EvictConfig & typeof DEFAULTS;

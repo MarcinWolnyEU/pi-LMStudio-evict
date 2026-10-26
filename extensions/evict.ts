@@ -7,7 +7,8 @@
  *   model_select        unload what should go, preload the new model
  *   before_agent_start  reload the active model if something evicted it
  *   session_start       sync models.json with LM Studio's catalogue
- *   session_shutdown    drop this session's claim
+ *   session_shutdown    drop this session's claim; on quit, optionally unload
+ *                       its model and stop the server
  *
  * `/lmstudio-evict-model` (also `/llm-evict-model`, `/model-load-unload`,
  * `/llm-load-unload`) opens a picker over the catalogue for manual
@@ -50,6 +51,7 @@ import {
 	healIfEvicted,
 	isResident,
 	matchesModelKey,
+	releaseOnQuit,
 } from "./lib/orchestrator.ts";
 import { chatModels, describeSync, syncModelsJson } from "./lib/registry.ts";
 import { dropClaim, newSessionId, pruneDeadClaims, writeClaim } from "./lib/sessions.ts";
@@ -91,6 +93,14 @@ export default function (pi: ExtensionAPI) {
 	const sessionId = newSessionId();
 	/** Epoch ms of the last confirmed sighting of the active model in memory. */
 	let residentAt = 0;
+	/** The LM Studio model this session last claimed, for the quit-time release. */
+	let heldModelKey: string | undefined;
+
+	/** Publish the claim, and remember it: `ctx.model` may be gone by shutdown. */
+	const claim = (modelKey: string | undefined) => {
+		heldModelKey = modelKey;
+		writeClaim(sessionId, modelKey);
+	};
 
 	const setStatus = (ctx: ExtensionContext, text: string | undefined) => {
 		try {
@@ -131,7 +141,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		pruneDeadClaims();
-		writeClaim(sessionId, activeModelKey(ctx));
+		claim(activeModelKey(ctx));
 		if (activeModelKey(ctx)) await startServerIfDown(ctx);
 
 		const config = loadResolvedConfig();
@@ -159,8 +169,14 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
 		dropClaim(sessionId);
+		if (event.reason !== "quit") return;
+		try {
+			await releaseOnQuit({ modelKey: heldModelKey, sessionId });
+		} catch {
+			// Quitting must never fail because LM Studio did.
+		}
 	});
 
 	// -----------------------------------------------------------------------
@@ -171,12 +187,12 @@ export default function (pi: ExtensionAPI) {
 		const provider = event.model.provider;
 		if (!provider?.startsWith(PROVIDER_PREFIX)) {
 			// Moved off LM Studio: stop protecting whatever we held.
-			writeClaim(sessionId, undefined);
+			claim(undefined);
 			return;
 		}
 
 		const modelKey = bareModelKey(provider, event.model.id);
-		writeClaim(sessionId, modelKey);
+		claim(modelKey);
 		// Force a residency check on the next turn.
 		residentAt = 0;
 
@@ -227,7 +243,7 @@ export default function (pi: ExtensionAPI) {
 
 		// Refresh the claim whatever the heal setting says: it is what stops
 		// other sessions evicting this model out from under the turn.
-		writeClaim(sessionId, modelKey);
+		claim(modelKey);
 
 		const config = loadResolvedConfig();
 		if (Date.now() - residentAt < residencyCacheMs(config)) return;
@@ -584,6 +600,16 @@ export default function (pi: ExtensionAPI) {
 			),
 			toggle(
 				ctx,
+				"unloadOnQuit",
+				`Unload on quit: ${onOff(config.unloadOnQuit)} — unload this session's model when pi exits`,
+			),
+			toggle(
+				ctx,
+				"stopServerOnQuit",
+				`Stop server on quit: ${onOff(config.stopServerOnQuit)} — when the last pi session exits`,
+			),
+			toggle(
+				ctx,
 				"healEvictions",
 				`Heal evictions: ${onOff(config.healEvictions)} — reload the active model if something unloads it`,
 			),
@@ -619,7 +645,9 @@ export default function (pi: ExtensionAPI) {
 			| "autoRegisterModels"
 			| "useMemoryEstimate"
 			| "matchContextWindow"
-			| "startServer",
+			| "startServer"
+			| "unloadOnQuit"
+			| "stopServerOnQuit",
 		label: string,
 	): { label: string; apply: () => void } {
 		return {

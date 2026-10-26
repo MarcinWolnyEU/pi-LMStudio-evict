@@ -214,6 +214,11 @@ export function startServer(): Promise<boolean> {
 	return lmsRun(["server", "start"], SERVER_START_TIMEOUT_MS);
 }
 
+/** `lms server stop`. */
+export function stopServer(): Promise<boolean> {
+	return lmsRun(["server", "stop"]);
+}
+
 /** Unload one model by its `lms ps` identifier. */
 export function unload(identifier: string): Promise<boolean> {
 	return lmsRun(["unload", identifier]);
