@@ -176,12 +176,14 @@ test("hasWrongContext: compares only when a context is wanted and known", () => 
 	assert.equal(hasWrongContext(sized("alpha", 65536), 32768), true, "too big is wrong too: it costs memory");
 });
 
-test("hasWrongContext: the 8192 a loading model reports is not taken at face value", () => {
-	// Mid-load, lms ps shows 8192 whatever the load asked for (AGENTS.md).
-	// Treating that as wrong would unload every load in flight.
+test("hasWrongContext: a copy that may still be loading is never judged", () => {
+	// lastUsedTime stays null for the whole load. Unloading on its reported
+	// context would kill the load in flight, whatever that context says:
+	// 0.3.x reports a placeholder 8192 there, 0.4.x the requested value.
 	assert.equal(hasWrongContext(sized("alpha", 8192, false), 32768), false);
-	// Once the model has served a request it has finished loading, so 8192 is
-	// real — the just-in-time-load-at-the-default case this exists to fix.
+	assert.equal(hasWrongContext(sized("alpha", 4096, false), 32768), false);
+	// Once loaded (or used, on 0.3.x) the value is real — the
+	// just-in-time-load-at-the-default case this exists to fix.
 	assert.equal(hasWrongContext(sized("alpha", 8192, true), 32768), true);
 });
 
