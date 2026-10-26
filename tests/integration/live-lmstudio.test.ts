@@ -29,7 +29,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { after, test } from "node:test";
 import { DEFAULTS } from "../../extensions/lib/config.ts";
-import { estimateMemory, listLoaded, unload } from "../../extensions/lib/lms.ts";
+import { estimateMemory, listLoaded, lmsBinary, unload } from "../../extensions/lib/lms.ts";
 import { formatBytes } from "../../extensions/lib/memory.ts";
 import { evictThenPreload, healIfEvicted, isResident } from "../../extensions/lib/orchestrator.ts";
 import { type SessionClaim, isProcessAlive, sessionsDir } from "../../extensions/lib/sessions.ts";
@@ -315,7 +315,7 @@ test(
 		// so there is no "still loading" flag to key off. If residency were
 		// judged any other way, this is where a duplicate `<key>:2` instance
 		// would be born and double the memory.
-		const loader = spawn("lms", ["load", target, "--yes"], {
+		const loader = spawn(lmsBinary(), ["load", target, "--yes"], {
 			stdio: "ignore",
 			windowsHide: true,
 		});

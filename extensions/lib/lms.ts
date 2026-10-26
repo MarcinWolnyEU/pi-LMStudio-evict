@@ -9,6 +9,9 @@
  */
 
 import { execFile, spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 /** Entry of `lms ps --json` — a model currently resident in memory. */
 export interface LoadedModel {
@@ -66,6 +69,41 @@ export interface ServerStatus {
 	port?: number;
 }
 
+/**
+ * Where to find `lms`: `LMS_PATH`, then `PATH`, then LM Studio's own install
+ * location (`~/.lmstudio/bin`).
+ *
+ * The last step is the one that matters on macOS. LM Studio adds that
+ * directory to the *login shell's* profile, so a pi started from a GUI
+ * launcher, an IDE, or a non-login shell has no `lms` on `PATH`, and every
+ * automatic path here would silently do nothing.
+ *
+ * Resolved once per process: none of these move while pi runs.
+ */
+let resolvedLms: string | undefined;
+
+export function lmsBinary(): string {
+	if (resolvedLms) return resolvedLms;
+	const exe = process.platform === "win32" ? "lms.exe" : "lms";
+	const candidates = [
+		process.env.LMS_PATH,
+		...(process.env.PATH ?? "").split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, exe)),
+		path.join(os.homedir(), ".lmstudio", "bin", exe),
+	];
+	const found = candidates.find((candidate) => {
+		if (!candidate) return false;
+		try {
+			fs.accessSync(candidate, fs.constants.X_OK);
+			return true;
+		} catch {
+			return false;
+		}
+	});
+	// Fall back to the bare name: spawn then fails the same way it always did.
+	resolvedLms = found ?? "lms";
+	return resolvedLms;
+}
+
 const JSON_TIMEOUT_MS = 15_000;
 const RUN_TIMEOUT_MS = 60_000;
 /** The estimate is a local calculation; it returns in well under a second. */
@@ -74,7 +112,7 @@ const ESTIMATE_TIMEOUT_MS = 30_000;
 /** Run `lms` and parse its JSON stdout. Resolves undefined on any failure. */
 export function lmsJson<T>(args: string[], timeoutMs = JSON_TIMEOUT_MS): Promise<T | undefined> {
 	return new Promise((resolve) => {
-		execFile("lms", args, { windowsHide: true, timeout: timeoutMs }, (error, stdout) => {
+		execFile(lmsBinary(), args, { windowsHide: true, timeout: timeoutMs }, (error, stdout) => {
 			if (error) return resolve(undefined);
 			try {
 				resolve(JSON.parse(stdout) as T);
@@ -96,7 +134,7 @@ export function lmsJson<T>(args: string[], timeoutMs = JSON_TIMEOUT_MS): Promise
  */
 export function lmsText(args: string[], timeoutMs = RUN_TIMEOUT_MS): Promise<string | undefined> {
 	return new Promise((resolve) => {
-		execFile("lms", args, { windowsHide: true, timeout: timeoutMs }, (error, stdout, stderr) => {
+		execFile(lmsBinary(), args, { windowsHide: true, timeout: timeoutMs }, (error, stdout, stderr) => {
 			resolve(error ? undefined : `${stdout}\n${stderr}`);
 		});
 	});
@@ -105,7 +143,7 @@ export function lmsText(args: string[], timeoutMs = RUN_TIMEOUT_MS): Promise<str
 /** Run `lms` for its side effect; resolves true when it exits cleanly. */
 export function lmsRun(args: string[], timeoutMs = RUN_TIMEOUT_MS): Promise<boolean> {
 	return new Promise((resolve) => {
-		execFile("lms", args, { windowsHide: true, timeout: timeoutMs }, (error) => resolve(!error));
+		execFile(lmsBinary(), args, { windowsHide: true, timeout: timeoutMs }, (error) => resolve(!error));
 	});
 }
 
@@ -140,7 +178,7 @@ export function lmsBackground(args: string[], options: BackgroundOptions = {}): 
 			resolve(ok);
 		};
 		try {
-			const child = spawn("lms", args, { stdio: "ignore", windowsHide: true, detached: true });
+			const child = spawn(lmsBinary(), args, { stdio: "ignore", windowsHide: true, detached: true });
 			child.on("error", () => settle(false)); // lms not on PATH, server down, …
 			child.once("exit", (code) => settle(code === 0));
 			// An un-unref'd child handle is itself what holds the loop open.
