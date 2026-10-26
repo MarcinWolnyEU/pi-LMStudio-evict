@@ -139,10 +139,42 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	pi.on("session_start", async (_event, ctx) => {
+	/**
+	 * Evict, then preload `modelKey`. Deliberately not awaited: a model load
+	 * takes tens of seconds and pi must not block on it. Progress goes to the
+	 * footer instead. A turn that starts meanwhile waits for it through the
+	 * heal, which queues on the same lock.
+	 */
+	const preloadInBackground = (ctx: ExtensionContext, modelKey: string) => {
+		void (async () => {
+			try {
+				await startServerIfDown(ctx);
+				const outcome = await evictThenPreload({
+					modelKey,
+					sessionId,
+					onProgress: (phase, detail) => {
+						if (phase === "evicting") setStatus(ctx, "lmstudio: evicting…");
+						else if (phase === "loading") setStatus(ctx, `lmstudio: loading ${detail}…`);
+					},
+				});
+				setStatus(ctx, undefined);
+				if (outcome.alreadyResident || outcome.loaded) residentAt = Date.now();
+			} catch {
+				setStatus(ctx, undefined);
+			}
+		})();
+	};
+
+	pi.on("session_start", async (event, ctx) => {
 		pruneDeadClaims();
-		claim(activeModelKey(ctx));
-		if (activeModelKey(ctx)) await startServerIfDown(ctx);
+		const modelKey = activeModelKey(ctx);
+		claim(modelKey);
+		if (modelKey) await startServerIfDown(ctx);
+		// pi fires no `model_select` for the model it starts on (`--model`, or
+		// the default from settings), so this is where a fresh process applies
+		// the switch policy. Not on resume/fork/new/reload: like a restore,
+		// that continues a model the user already had.
+		if (modelKey && event.reason === "startup") preloadInBackground(ctx, modelKey);
 
 		const config = loadResolvedConfig();
 		if (!config.autoRegisterModels) return;
@@ -212,25 +244,7 @@ export default function (pi: ExtensionAPI) {
 		// heal on the next turn picks up the pieces.
 		if (!ctx.isIdle()) return;
 
-		// Deliberately not awaited: a model load takes tens of seconds and pi
-		// must not block on it. Progress goes to the footer instead.
-		void (async () => {
-			try {
-				await startServerIfDown(ctx);
-				const outcome = await evictThenPreload({
-					modelKey,
-					sessionId,
-					onProgress: (phase, detail) => {
-						if (phase === "evicting") setStatus(ctx, "lmstudio: evicting…");
-						else if (phase === "loading") setStatus(ctx, `lmstudio: loading ${detail}…`);
-					},
-				});
-				setStatus(ctx, undefined);
-				if (outcome.alreadyResident || outcome.loaded) residentAt = Date.now();
-			} catch {
-				setStatus(ctx, undefined);
-			}
-		})();
+		preloadInBackground(ctx, modelKey);
 	});
 
 	// -----------------------------------------------------------------------

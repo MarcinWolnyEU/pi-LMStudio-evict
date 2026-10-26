@@ -449,6 +449,38 @@ test(
 	},
 );
 
+test(
+	"startup on a model (pi --model) evicts the others and preloads it; resume does not",
+	{ timeout: LONG_TIMEOUT_MS },
+	async (t) => {
+		if (!findJitiEntry()) return t.skip("pi not installed");
+		const { small } = await preflight();
+		const [x, y] = [small[0].modelKey, small[1].modelKey];
+		await resetLmStudio();
+		const ws = workspace();
+		t.after(() => releaseAll(ws));
+
+		// pi emits no model_select for the model it starts on, so this goes
+		// through session_start alone.
+		await timed(t, `start on ${y} beside nothing`, () =>
+			runChild("A", ws, [{ op: "session_start", model: y }, { op: "session_shutdown" }]),
+		);
+		assert.deepEqual(await residentKeys(), [y], "starting on a model preloads it");
+
+		const resumed = await runChild("B", ws, [
+			{ op: "session_start", model: x, reason: "resume" },
+			{ op: "session_shutdown" },
+		]);
+		assert.equal(resumed.error, undefined);
+		assert.deepEqual(await residentKeys(), [y], "a resume continues the user's state and evicts nothing");
+
+		await timed(t, `start on ${x} with ${y} resident`, () =>
+			runChild("C", ws, [{ op: "session_start", model: x }, { op: "session_shutdown" }]),
+		);
+		assert.deepEqual(await residentKeys(), [x], `${y} should have been evicted for ${x}`);
+	},
+);
+
 test("teardown: LM Studio is left empty", { timeout: LONG_TIMEOUT_MS }, async () => {
 	await resetLmStudio();
 	assert.deepEqual(await residentIdentifiers(), []);

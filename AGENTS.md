@@ -53,7 +53,7 @@ There is no build step; pi loads `.ts` directly via jiti. There are no `node_mod
 
 | Event | What happens |
 |---|---|
-| `session_start` | Prune dead claims, write this session's claim, `ensureServer` (when on an LM Studio model), reconcile `models.json`, `modelRegistry.refresh()` |
+| `session_start` | Prune dead claims, write this session's claim, `ensureServer` (when on an LM Studio model); on `reason: "startup"` only, `evictThenPreload` in a floating task — pi 1.4 emits **no** `model_select` for the model a process starts on (`--model` or the settings default; verified with a probe extension in print mode); reconcile `models.json`, `modelRegistry.refresh()` |
 | `model_select` | Update the claim; unless restore / same-model / mid-stream, run `ensureServer` then `evictThenPreload` in a floating task |
 | `before_agent_start` | Past the residency cache: `ensureServer`, then heal — if the active model is not resident at the wanted context, (unload and) reload it **before** the turn proceeds |
 | `session_shutdown` | Drop this session's claim; on `reason: "quit"` only, `releaseOnQuit` |
@@ -247,7 +247,7 @@ Honoured only when the owning PID is alive and `updatedAt` is within `CLAIM_STAL
 
 ## Tests
 
-`npm test`, or `test:unit` / `test:integration`. Node's built-in runner and type stripping — needs Node 22.18+ / 24+, no dependencies. `--test-concurrency=1` is essential: the integration tests share one LM Studio. A full green run is **108 passing, 1 skipped** (109 tests) (~3–7 minutes, most of it real model loads).
+`npm test`, or `test:unit` / `test:integration`. Node's built-in runner and type stripping — needs Node 22.18+ / 24+, no dependencies. `--test-concurrency=1` is essential: the integration tests share one LM Studio. A full green run is **109 passing, 1 skipped** (110 tests) (~3–7 minutes, most of it real model loads).
 
 **Known flake, cause identified: another client on the same LM Studio.** `multi-session.test.ts` › "heal fires through the real entry point…" passed in isolation and in file-only runs, but failed in three of five runs made while other agents were using the machine's LM Studio. The failures differed each time (a stray extra model and a duplicate `google/…` instance right after the load, a 237 s load instead of ~10 s, a model that reappeared during the 16 s cache-expiry sleep with no heal notification). The cause was another agent loading and unloading models that the test could not see; the test assumes nothing else touches LM Studio. If it fails, rerun it alone with `--test-name-pattern="heal fires"` with every other pi/LM Studio client closed before suspecting the lock; a persistent failure in that state is a real bug.
 
