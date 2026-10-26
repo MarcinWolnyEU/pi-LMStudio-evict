@@ -26,7 +26,8 @@ pi-lmstudio-evict/
     ├── unit/
     │   ├── parsers.test.ts         pure functions, no LM Studio
     │   ├── find-pi.test.ts         managed-install discovery, version validation, launcher / PI_MANAGED_INSTALL_ROOT lookup
-    │   └── loading.test.ts         withLoader / withStatus against a fake pi context
+    │   ├── loading.test.ts         withLoader / withStatus against a fake pi context
+    │   └── lms-binary.test.ts      lmsBinary() resolution order, each case in a fresh child process
     ├── support/
     │   ├── app-child.ts            headless stand-in for a pi session
     │   ├── barrier.ts              cross-process rendezvous (ordering, not sleeps)
@@ -65,7 +66,7 @@ There is no build step; pi loads `.ts` directly via jiti. There are no `node_mod
 Both take the cross-process lock, and both are exported so the integration tests drive the real code rather than a copy of it.
 
 - `evictThenPreload({ modelKey, sessionId })` — plan the eviction, unload the victims, then load the target if it isn't already resident. Strictly sequenced: loading before the unload finishes would briefly hold two models, or let `unload --all` kill the load in flight.
-- `healIfEvicted({ modelKey, sessionId })` — cheap `lms ps` check; if the model is gone, take the lock, **re-check** (another session may have loaded it while we queued), then load. Deliberately narrow: it reloads the target and evicts nothing, because surprise unloads at prompt time are worse than a stray resident model. The next switch applies the full policy.
+- `healIfEvicted({ modelKey, sessionId })` — cheap `lms ps` check; if the model is gone, take the lock, **re-check** (another session may have loaded it while we queued), then load. Deliberately narrow: it reloads the target and evicts nothing else, because surprise unloads at prompt time are worse than a stray resident model. The next switch applies the full policy. The one unload it does is of the target itself when it is resident at the wrong context (unless another session claims it), and only after re-checking inside the lock.
 
 `planEviction()` is pure and is where the policy lives: keep one instance of the target, keep everything another live session claimed, unload the rest (including surplus copies of the target). Given a `contextLength`, the instance kept must be at that context; a target copy at another context becomes a victim (unless claimed), and the target is reloaded.
 
@@ -90,7 +91,7 @@ Two smaller sequences, both opt-in and both under the lock with a short `timeout
 {
   "ttlSeconds": 900,
   "contextLength": 32768,
-  "matchContextWindow": true,
+  "matchContextWindow": false,
   "extraLoadArgs": ["--gpu", "max"],
   "modelLoadArgs": { "qwen/qwen3.5-9b": ["--parallel", "2"] },
   "startServer": false,

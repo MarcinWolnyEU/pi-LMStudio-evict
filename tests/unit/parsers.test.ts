@@ -239,15 +239,17 @@ test("contextLengthFor: hand-written contextWindow, then the global setting, the
 		}),
 	);
 
-	assert.equal(contextLengthFor("hand", {}, modelsPath), 32768);
-	assert.equal(contextLengthFor("remote", {}, modelsPath), 16384, "any lmstudio* provider");
+	assert.equal(contextLengthFor("hand", {}, modelsPath), undefined, "matchContextWindow is opt-in");
+	const match = { matchContextWindow: true };
+	assert.equal(contextLengthFor("hand", match, modelsPath), 32768);
+	assert.equal(contextLengthFor("remote", match, modelsPath), 16384, "any lmstudio* provider");
 	// A generated entry carries the model's maximum; loading at that could
 	// need more memory than the machine has.
-	assert.equal(contextLengthFor("managed", {}, modelsPath), undefined);
-	assert.equal(contextLengthFor("managed", { contextLength: 16384 }, modelsPath), 16384);
-	assert.equal(contextLengthFor("broken", { contextLength: 8192 }, modelsPath), 8192);
-	assert.equal(contextLengthFor("elsewhere", {}, modelsPath), undefined, "only LM Studio providers");
-	assert.equal(contextLengthFor("hand", { contextLength: 4096 }, modelsPath), 32768, "per-model wins");
+	assert.equal(contextLengthFor("managed", match, modelsPath), undefined);
+	assert.equal(contextLengthFor("managed", { ...match, contextLength: 16384 }, modelsPath), 16384);
+	assert.equal(contextLengthFor("broken", { ...match, contextLength: 8192 }, modelsPath), 8192);
+	assert.equal(contextLengthFor("elsewhere", match, modelsPath), undefined, "only LM Studio providers");
+	assert.equal(contextLengthFor("hand", { ...match, contextLength: 4096 }, modelsPath), 32768, "per-model wins");
 	assert.equal(contextLengthFor("hand", { matchContextWindow: false, contextLength: 4096 }, modelsPath), 4096);
 	assert.equal(contextLengthFor("hand", { contextLength: 0 }, path.join(dir, "missing.json")), undefined);
 });
@@ -334,6 +336,7 @@ test("extraArgsFor: drops flags the extension owns, with their values", () => {
 			"--gpu", "0.5",
 			"--context-length", "4096",
 			"-c", "4096",
+			"-c8192",
 			"--ttl=60",
 			"--identifier", "mine",
 			"--estimate-only",

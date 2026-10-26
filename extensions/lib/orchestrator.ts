@@ -98,7 +98,11 @@ export function hasWrongContext(entry: LoadedModel, contextLength: number | unde
 }
 
 /** Is `modelKey` resident at a context we can use? */
-export function isUsable(loaded: LoadedModel[], modelKey: string, contextLength: number | undefined): boolean {
+export function isUsable(
+	loaded: LoadedModel[],
+	modelKey: string,
+	contextLength: number | undefined,
+): boolean {
 	return loaded.some((entry) => matchesModelKey(entry, modelKey) && !hasWrongContext(entry, contextLength));
 }
 

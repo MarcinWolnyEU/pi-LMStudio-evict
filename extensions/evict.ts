@@ -169,12 +169,14 @@ export default function (pi: ExtensionAPI) {
 		pruneDeadClaims();
 		const modelKey = activeModelKey(ctx);
 		claim(modelKey);
-		if (modelKey) await startServerIfDown(ctx);
 		// pi fires no `model_select` for the model it starts on (`--model`, or
 		// the default from settings), so this is where a fresh process applies
 		// the switch policy. Not on resume/fork/new/reload: like a restore,
-		// that continues a model the user already had.
+		// that continues a model the user already had. Neither path is awaited:
+		// a cold server start can take a while, and startup must not wait for
+		// it — the first turn's heal does, through the same lock.
 		if (modelKey && event.reason === "startup") preloadInBackground(ctx, modelKey);
+		else if (modelKey) void startServerIfDown(ctx);
 
 		const config = loadResolvedConfig();
 		if (!config.autoRegisterModels) return;
@@ -285,6 +287,11 @@ export default function (pi: ExtensionAPI) {
 			const outcome = await Promise.race([heal, timeout]);
 			setStatus(ctx, undefined);
 			// Undefined means the cap expired; the model may still be loading.
+			if (outcome?.reloaded && !outcome.ok && outcome.wrongContext) {
+				// The wrong-context copy is already gone; say so rather than let
+				// the turn fail on a just-in-time load with no explanation.
+				ctx.ui.notify(`Unloaded ${modelKey} to fix its context, but the reload failed`, "warning");
+			}
 			if (!outcome?.checked || !outcome.ok) return;
 			residentAt = Date.now();
 			if (outcome.reloaded && outcome.wrongContext) {
@@ -448,7 +455,9 @@ export default function (pi: ExtensionAPI) {
 					async () => {
 						ctx.ui.notify(`Loading ${model.modelKey} in the background…`, "info");
 						const ok = await withStatus(ctx, `lmstudio: loading ${model.modelKey}…`, () =>
-							lmsBackground(loadArgs(model.modelKey, loadConfig(), contextLengthFor(model.modelKey))),
+							lmsBackground(
+								loadArgs(model.modelKey, loadConfig(), contextLengthFor(model.modelKey)),
+							),
 						);
 						ctx.ui.notify(
 							ok ? `Loaded ${model.modelKey}` : `Failed to load ${model.modelKey}`,
@@ -599,13 +608,16 @@ export default function (pi: ExtensionAPI) {
 					if (args.length === 0) delete stored.extraLoadArgs;
 					else stored.extraLoadArgs = args;
 					saveConfig(stored);
-					ctx.ui.notify(args.length ? `Extra load flags: ${args.join(" ")}` : "Extra load flags cleared", "info");
+					ctx.ui.notify(
+						args.length ? `Extra load flags: ${args.join(" ")}` : "Extra load flags cleared",
+						"info",
+					);
 				},
 			},
 			toggle(
 				ctx,
 				"matchContextWindow",
-				`Match contextWindow: ${onOff(config.matchContextWindow)} — load at a hand-written models.json window`,
+				`Match contextWindow: ${onOff(config.matchContextWindow)} — load at a hand-written window`,
 			),
 			toggle(
 				ctx,
