@@ -539,6 +539,24 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Context length set — models load at ${length} tokens`, "info");
 				},
 			},
+			{
+				label: config.extraLoadArgs?.length
+					? `Extra load flags: ${config.extraLoadArgs.join(" ")}`
+					: "Extra load flags: none",
+				apply: async () => {
+					const stored = loadConfig();
+					const raw = await ctx.ui.input(
+						"Extra `lms load` flags, space-separated (e.g. --gpu max --parallel 2); empty = none",
+						stored.extraLoadArgs?.join(" ") ?? "",
+					);
+					if (raw === undefined) return;
+					const args = raw.trim().split(/\s+/).filter(Boolean);
+					if (args.length === 0) delete stored.extraLoadArgs;
+					else stored.extraLoadArgs = args;
+					saveConfig(stored);
+					ctx.ui.notify(args.length ? `Extra load flags: ${args.join(" ")}` : "Extra load flags cleared", "info");
+				},
+			},
 			toggle(
 				ctx,
 				"matchContextWindow",
