@@ -68,7 +68,7 @@ Then `/reload` in pi, or restart it.
 | `--model lmstudio/...` on the command line | Same |
 | Prompt sent while the active model is no longer loaded | Reload it first (see **Healing**) |
 | Prompt sent while the active model is loaded at the wrong context | Unload it, then reload it at the right one (see **Context length**) |
-| Session start | Sync `models.json` with LM Studio's catalogue; start the server if `startServer` is on |
+| Session start | Sync `models.json` with LM Studio's catalogue; start the server if `startServer` is on. On a fresh start (not resume) on an LM Studio model, unload what should go and preload it, as a switch would: pi fires no `model_select` for the model it starts on |
 | pi quits normally | Unload this session's model if `unloadOnQuit` is on and no other live session claims it; stop the server if `stopServerOnQuit` is on and this was the last session |
 | Session restore picking an LM Studio model | No-op (would force a redundant reload) |
 | Reselecting the same model | No-op, and never a second copy (see below) |
@@ -211,7 +211,7 @@ npm run typecheck
 
 The integration tests fail, rather than skip, when LM Studio isn't running or has fewer than two chat models, so a green run means the behaviour was exercised. They redirect `PI_CODING_AGENT_DIR` to a temporary directory, so your own config and `models.json` are never touched. They do leave LM Studio with no models loaded.
 
-A full run is 109 tests and takes a few minutes, most of it real model loads. What they cover:
+A full run is 110 tests and takes a few minutes, most of it real model loads. What they cover:
 
 | Area | How it's tested |
 |---|---|
@@ -221,7 +221,7 @@ A full run is 109 tests and takes a few minutes, most of it real model loads. Wh
 | `models.json` policy | Synthetic catalogues for the ownership rules, then the real catalogue validated by pi's own schema loader |
 | Extension loading | Imported through pi's bundled jiti, the way pi does it |
 
-One test is opt-in and reports itself as skipped unless you enable it: the negative guardrail verdict ("this model will fail to load based on your resource guardrails settings"). LM Studio only produces that verdict from its own guardrail setting, which lives in the desktop app's settings file and can't be set from the CLI, so the test temporarily edits that file (backed up first, restored in `finally` and again on process exit, and asserted byte-identical). Nothing else in the suite touches LM Studio's configuration, which is why this one asks for consent. To run all 109 with nothing skipped:
+One test is opt-in and reports itself as skipped unless you enable it: the negative guardrail verdict ("this model will fail to load based on your resource guardrails settings"). LM Studio only produces that verdict from its own guardrail setting, which lives in the desktop app's settings file and can't be set from the CLI, so the test temporarily edits that file (backed up first, restored in `finally` and again on process exit, and asserted byte-identical). Nothing else in the suite touches LM Studio's configuration, which is why this one asks for consent. To run all 110 with nothing skipped:
 
 ```bash
 PI_LMSTUDIO_EVICT_TEST_GUARDRAILS=1 npm test          # bash

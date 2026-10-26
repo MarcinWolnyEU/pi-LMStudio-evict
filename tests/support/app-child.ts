@@ -27,7 +27,8 @@ import { findJitiEntry } from "./find-pi.ts";
 
 /** One scripted step. */
 export type AppOp =
-	| { op: "session_start"; reason?: string }
+	/** `model`: the model the process starts on, as with `pi --model`. */
+	| { op: "session_start"; reason?: string; model?: string }
 	| { op: "model_select"; model: string; source?: string; previous?: string }
 	| { op: "turn"; prompt?: string }
 	| { op: "session_shutdown"; reason?: string }
@@ -211,7 +212,10 @@ for (const [index, step] of script.entries()) {
 
 	switch (step.op) {
 		case "session_start":
+			if (step.model) activeModel = { provider: "lmstudio", id: step.model };
 			await emit("session_start", { reason: step.reason ?? "startup" });
+			// Starting on a model may kick off a background preload.
+			if (step.model) detail.settled = await waitForSettled();
 			break;
 
 		case "model_select": {
