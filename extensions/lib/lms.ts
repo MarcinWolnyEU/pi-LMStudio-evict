@@ -108,6 +108,8 @@ export function lmsBinary(): string {
 
 const JSON_TIMEOUT_MS = 15_000;
 const RUN_TIMEOUT_MS = 60_000;
+/** A cold `lms server start` may first have to boot the LM Studio service. */
+const SERVER_START_TIMEOUT_MS = 120_000;
 /** The estimate is a local calculation; it returns in well under a second. */
 const ESTIMATE_TIMEOUT_MS = 30_000;
 
@@ -205,6 +207,11 @@ export function listCatalog(): Promise<CatalogModel[] | undefined> {
 /** Local server state, including the port it listens on. */
 export function serverStatus(): Promise<ServerStatus | undefined> {
 	return lmsJson<ServerStatus>(["server", "status", "--json"]);
+}
+
+/** `lms server start`. Resolves true once the server reports it is up. */
+export function startServer(): Promise<boolean> {
+	return lmsRun(["server", "start"], SERVER_START_TIMEOUT_MS);
 }
 
 /** Unload one model by its `lms ps` identifier. */

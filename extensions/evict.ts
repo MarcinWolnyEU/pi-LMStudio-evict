@@ -45,6 +45,7 @@ import { type Fit, fitOf, formatBytes, ram, vram } from "./lib/memory.ts";
 import {
 	bareModelKey,
 	duplicateIdentifiers,
+	ensureServer,
 	evictThenPreload,
 	healIfEvicted,
 	isResident,
@@ -119,9 +120,19 @@ export default function (pi: ExtensionAPI) {
 	// Startup: catalogue sync and claim registration
 	// -----------------------------------------------------------------------
 
+	/** Start the server when the setting asks for it, and say so when it happened. */
+	const startServerIfDown = async (ctx: ExtensionContext) => {
+		try {
+			if (await ensureServer()) ctx.ui.notify("Started the LM Studio server", "info");
+		} catch {
+			// Best effort, like every automatic path.
+		}
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
 		pruneDeadClaims();
 		writeClaim(sessionId, activeModelKey(ctx));
+		if (activeModelKey(ctx)) await startServerIfDown(ctx);
 
 		const config = loadResolvedConfig();
 		if (!config.autoRegisterModels) return;
@@ -189,6 +200,7 @@ export default function (pi: ExtensionAPI) {
 		// must not block on it. Progress goes to the footer instead.
 		void (async () => {
 			try {
+				await startServerIfDown(ctx);
 				const outcome = await evictThenPreload({
 					modelKey,
 					sessionId,
@@ -218,8 +230,11 @@ export default function (pi: ExtensionAPI) {
 		writeClaim(sessionId, modelKey);
 
 		const config = loadResolvedConfig();
-		if (!config.healEvictions) return;
 		if (Date.now() - residentAt < residencyCacheMs(config)) return;
+		// Before the heal: a resident model behind a stopped server still
+		// fails the turn.
+		await startServerIfDown(ctx);
+		if (!config.healEvictions) return;
 
 		const heal = healIfEvicted({
 			modelKey,
@@ -564,6 +579,11 @@ export default function (pi: ExtensionAPI) {
 			),
 			toggle(
 				ctx,
+				"startServer",
+				`Start server: ${onOff(config.startServer)} — run lms server start when it is down`,
+			),
+			toggle(
+				ctx,
 				"healEvictions",
 				`Heal evictions: ${onOff(config.healEvictions)} — reload the active model if something unloads it`,
 			),
@@ -598,7 +618,8 @@ export default function (pi: ExtensionAPI) {
 			| "multiSessionSafety"
 			| "autoRegisterModels"
 			| "useMemoryEstimate"
-			| "matchContextWindow",
+			| "matchContextWindow"
+			| "startServer",
 		label: string,
 	): { label: string; apply: () => void } {
 		return {

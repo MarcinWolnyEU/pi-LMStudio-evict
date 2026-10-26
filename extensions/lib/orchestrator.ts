@@ -9,7 +9,15 @@
  */
 
 import { type ResolvedConfig, contextLengthFor, loadArgs, loadResolvedConfig } from "./config.ts";
-import { type LoadedModel, listLoaded, lmsBackground, unload, unloadAll } from "./lms.ts";
+import {
+	type LoadedModel,
+	listLoaded,
+	lmsBackground,
+	serverStatus,
+	startServer,
+	unload,
+	unloadAll,
+} from "./lms.ts";
 import {
 	type AcquireOptions,
 	type LockHandle,
@@ -131,6 +139,42 @@ export function planEviction(
 		victims: loaded.filter((entry) => !keepIdentifiers.has(entry.identifier)),
 		targetResident: targetInstances.some((entry) => keepIdentifiers.has(entry.identifier)),
 	};
+}
+
+/**
+ * How long a server check waits for the lock before going ahead anyway. A
+ * model load can hold the lock for minutes, and the server is almost
+ * certainly up in that case; a second `server start` is harmless.
+ */
+const SERVER_LOCK_TIMEOUT_MS = 10_000;
+
+export interface ServerOptions {
+	config?: ResolvedConfig;
+	lock?: AcquireOptions;
+}
+
+/**
+ * Start LM Studio's local server if `startServer` is on and it is down.
+ * Resolves true when this call started it, false when nothing was needed or
+ * the start failed, and undefined when the setting is off.
+ *
+ * `lms ps`, `lms load` and friends work without the server — they talk to
+ * the LM Studio service — but pi's requests go over its HTTP API, so a
+ * resident model behind a stopped server still fails every turn.
+ */
+export async function ensureServer(options: ServerOptions = {}): Promise<boolean | undefined> {
+	const config = options.config ?? loadResolvedConfig();
+	if (!config.startServer) return undefined;
+	if ((await serverStatus())?.running) return false;
+
+	return withLock(
+		async (): Promise<boolean> => {
+			// Re-check: another session may have started it while we queued.
+			if ((await serverStatus())?.running) return false;
+			return startServer();
+		},
+		{ timeoutMs: SERVER_LOCK_TIMEOUT_MS, ...options.lock },
+	);
 }
 
 export type EvictPhase = "evicting" | "loading" | "done";

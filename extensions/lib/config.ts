@@ -72,6 +72,12 @@ export interface EvictConfig {
 	extraLoadArgs?: string[];
 	/** Per-model extra `lms load` flags, keyed by model key; added after `extraLoadArgs`. */
 	modelLoadArgs?: Record<string, string[]>;
+	/**
+	 * Start LM Studio's local server (`lms server start`) when an LM Studio
+	 * model is in use and the server is down. Off by default: starting a
+	 * server is a bigger step than loading a model, so it is opt-in.
+	 */
+	startServer?: boolean;
 }
 
 /** Applied wherever the config file leaves a field out. */
@@ -83,6 +89,7 @@ export const DEFAULTS: Required<
 	autoRegisterModels: true,
 	useMemoryEstimate: true,
 	matchContextWindow: true,
+	startServer: false,
 };
 
 export type ResolvedConfig = EvictConfig & typeof DEFAULTS;
