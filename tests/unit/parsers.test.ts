@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { contextLengthFor, loadArgs } from "../../extensions/lib/config.ts";
+import { contextLengthFor, extraArgsFor, loadArgs } from "../../extensions/lib/config.ts";
 import { type LoadedModel, parseEstimate, parseSizeBytes } from "../../extensions/lib/lms.ts";
 import { fitOf, formatBytes } from "../../extensions/lib/memory.ts";
 import {
@@ -314,4 +314,49 @@ test("duplicateIdentifiers flags only the surplus copies of a model", () => {
 
 	// Entries without a modelKey fall back to the identifier minus its `:n` suffix.
 	assert.deepEqual([...duplicateIdentifiers([loaded("alpha"), loaded("alpha:2")])], ["alpha:2"]);
+});
+
+test("extraArgsFor: global flags, then the model's own", () => {
+	const config = {
+		extraLoadArgs: ["--gpu", "max"],
+		modelLoadArgs: { alpha: ["--speculative-draft-mtp"], beta: ["--parallel", "2"] },
+	};
+	assert.deepEqual(extraArgsFor("alpha", config), ["--gpu", "max", "--speculative-draft-mtp"]);
+	assert.deepEqual(extraArgsFor("gamma", config), ["--gpu", "max"]);
+	assert.deepEqual(extraArgsFor("alpha", {}), []);
+});
+
+test("extraArgsFor: drops flags the extension owns, with their values", () => {
+	const config = {
+		extraLoadArgs: [
+			"--gpu", "0.5",
+			"--context-length", "4096",
+			"-c", "4096",
+			"--ttl=60",
+			"--identifier", "mine",
+			"--estimate-only",
+			"-y",
+			"--parallel", "4",
+		],
+	};
+	assert.deepEqual(extraArgsFor("alpha", config), ["--gpu", "0.5", "--parallel", "4"]);
+});
+
+test("extraArgsFor: tolerates hand-edited junk", () => {
+	const config = { extraLoadArgs: "--gpu max", modelLoadArgs: { alpha: [42, "", "--parallel", "2"] } } as never;
+	assert.deepEqual(extraArgsFor("alpha", config), ["--parallel", "2"]);
+});
+
+test("loadArgs: extra flags go last, after the ones the extension sets", () => {
+	assert.deepEqual(loadArgs("alpha", { ttlSeconds: 900, extraLoadArgs: ["--gpu", "max"] }, 32768), [
+		"load",
+		"alpha",
+		"--yes",
+		"--ttl",
+		"900",
+		"--context-length",
+		"32768",
+		"--gpu",
+		"max",
+	]);
 });

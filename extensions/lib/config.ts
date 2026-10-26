@@ -63,10 +63,21 @@ export interface EvictConfig {
 	 * context, which can be 256k and more than the machine can hold.
 	 */
 	matchContextWindow?: boolean;
+	/**
+	 * Extra `lms load` flags for every load this extension performs, e.g.
+	 * `["--gpu", "max", "--parallel", "2", "--speculative-draft-mtp"]` — see
+	 * `lms load --help` for what your LM Studio supports. Flags the extension
+	 * sets itself are dropped (see `OWNED_FLAGS`).
+	 */
+	extraLoadArgs?: string[];
+	/** Per-model extra `lms load` flags, keyed by model key; added after `extraLoadArgs`. */
+	modelLoadArgs?: Record<string, string[]>;
 }
 
 /** Applied wherever the config file leaves a field out. */
-export const DEFAULTS: Required<Omit<EvictConfig, "ttlSeconds" | "contextLength">> = {
+export const DEFAULTS: Required<
+	Omit<EvictConfig, "ttlSeconds" | "contextLength" | "extraLoadArgs" | "modelLoadArgs">
+> = {
 	healEvictions: true,
 	multiSessionSafety: true,
 	autoRegisterModels: true,
@@ -125,6 +136,46 @@ export function saveConfig(config: EvictConfig): void {
 	fs.writeFileSync(configPath(), `${JSON.stringify(config, null, "\t")}\n`, "utf-8");
 }
 
+/**
+ * `lms load` flags the extension owns, mapped to whether they take a value.
+ * A user copy would fight the extension's own: a second `--context-length`
+ * defeats the wrong-context check, `--identifier` breaks residency matching
+ * (and with it the `key:2` duplicate guard), `--estimate-only` loads nothing.
+ */
+const OWNED_FLAGS: ReadonlyMap<string, boolean> = new Map([
+	["--yes", false],
+	["-y", false],
+	["--estimate-only", false],
+	["--ttl", true],
+	["--context-length", true],
+	["-c", true],
+	["--identifier", true],
+]);
+
+/**
+ * The user's extra flags for `modelKey`, with the ones in `OWNED_FLAGS`
+ * (and their values, in both `--flag value` and `--flag=value` form) removed.
+ * Non-string entries are ignored; config is hand-editable JSON.
+ */
+export function extraArgsFor(modelKey: string, config: EvictConfig): string[] {
+	const raw = [
+		...(Array.isArray(config.extraLoadArgs) ? config.extraLoadArgs : []),
+		...(Array.isArray(config.modelLoadArgs?.[modelKey]) ? config.modelLoadArgs[modelKey] : []),
+	].filter((arg): arg is string => typeof arg === "string" && arg !== "");
+
+	const kept: string[] = [];
+	for (let i = 0; i < raw.length; i++) {
+		const flag = raw[i].split("=")[0];
+		const takesValue = OWNED_FLAGS.get(flag);
+		if (takesValue === undefined) {
+			kept.push(raw[i]);
+			continue;
+		}
+		if (takesValue && !raw[i].includes("=")) i++; // skip its value too
+	}
+	return kept;
+}
+
 /** A positive whole number of tokens, or undefined. */
 function tokens(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
@@ -180,5 +231,6 @@ export function loadArgs(modelKey: string, config: EvictConfig = loadConfig(), c
 	}
 	const context = tokens(contextLength);
 	if (context) args.push("--context-length", String(context));
+	args.push(...extraArgsFor(modelKey, config));
 	return args;
 }
