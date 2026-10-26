@@ -15,6 +15,7 @@ import {
 	lmsBackground,
 	serverStatus,
 	startServer,
+	stopServer,
 	unload,
 	unloadAll,
 } from "./lms.ts";
@@ -22,6 +23,7 @@ import {
 	type AcquireOptions,
 	type LockHandle,
 	claimedByOthers,
+	liveClaims,
 	pruneDeadClaims,
 	withLock,
 } from "./sessions.ts";
@@ -405,4 +407,65 @@ export async function healIfEvicted(options: HealOptions): Promise<HealOutcome> 
 			durationMs: Date.now() - started,
 		};
 	}, options.lock);
+}
+
+/**
+ * How long quitting waits for the lock. Quitting must stay quick; past this
+ * the body runs anyway, and its claim check still protects other sessions.
+ */
+const QUIT_LOCK_TIMEOUT_MS = 5_000;
+
+export interface QuitOptions {
+	/** The model this session was using, if it was an LM Studio one. */
+	modelKey?: string;
+	sessionId: string;
+	config?: ResolvedConfig;
+	lock?: AcquireOptions;
+}
+
+export interface QuitOutcome {
+	/** Identifiers unloaded, including any surplus `key:n` copies. */
+	unloaded: string[];
+	/** True when the model was left loaded because another live session claims it. */
+	spared: boolean;
+	stoppedServer: boolean;
+	durationMs: number;
+}
+
+/**
+ * Release what this session held when pi quits: its model (`unloadOnQuit`)
+ * and, if it was the last live pi session, the server (`stopServerOnQuit`).
+ *
+ * Only for a real quit. `/new`, `/resume` and reload also shut a session
+ * down, but the same process carries on and would just load the model again.
+ */
+export async function releaseOnQuit(options: QuitOptions): Promise<QuitOutcome> {
+	const started = Date.now();
+	const config = options.config ?? loadResolvedConfig();
+	const { modelKey, sessionId } = options;
+	const outcome: QuitOutcome = { unloaded: [], spared: false, stoppedServer: false, durationMs: 0 };
+	if (!config.unloadOnQuit && !config.stopServerOnQuit) return outcome;
+
+	return withLock(
+		async (_locked, handle): Promise<QuitOutcome> => {
+			if (config.unloadOnQuit && modelKey) {
+				const claimed = config.multiSessionSafety ? claimedByOthers(sessionId) : new Set<string>();
+				if (claimed.has(modelKey) || (handle && !handle.isValid())) {
+					outcome.spared = true;
+				} else {
+					for (const entry of (await listLoaded()) ?? []) {
+						if (!matchesModelKey(entry, modelKey)) continue;
+						if (await unload(entry.identifier)) outcome.unloaded.push(entry.identifier);
+					}
+				}
+			}
+			// Other pi sessions count whatever model they are on, LM Studio or
+			// not yet: they may switch to one, and the server is shared.
+			const othersAlive = liveClaims().some((claim) => claim.sessionId !== sessionId);
+			if (config.stopServerOnQuit && !othersAlive) outcome.stoppedServer = await stopServer();
+			outcome.durationMs = Date.now() - started;
+			return outcome;
+		},
+		{ timeoutMs: QUIT_LOCK_TIMEOUT_MS, ...options.lock },
+	);
 }
