@@ -71,6 +71,9 @@ export interface ServerStatus {
 	port?: number;
 }
 
+/** Memoised result of `lmsBinary()`. */
+let resolvedLms: string | undefined;
+
 /**
  * Where to find `lms`: `LMS_PATH`, then `PATH`, then LM Studio's own install
  * location (`~/.lmstudio/bin`).
@@ -82,8 +85,6 @@ export interface ServerStatus {
  *
  * Resolved once per process: none of these move while pi runs.
  */
-let resolvedLms: string | undefined;
-
 export function lmsBinary(): string {
 	if (resolvedLms) return resolvedLms;
 	const exe = process.platform === "win32" ? "lms.exe" : "lms";

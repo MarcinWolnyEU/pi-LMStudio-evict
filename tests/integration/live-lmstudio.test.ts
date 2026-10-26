@@ -424,7 +424,8 @@ test(
 	async () => {
 		const { small } = await preflight();
 		const target = small[0].modelKey;
-		// Resident at 16384 from the previous test.
+		await resetLmStudio();
+		assert.ok(await lmsRun(["load", target, "--yes", "--context-length", "16384"]), "setup load failed");
 		writeForeignClaim(OTHER_SESSION, target, process.pid);
 		try {
 			const outcome = await healIfEvicted({ modelKey: target, sessionId: SESSION, contextLength: 4096 });

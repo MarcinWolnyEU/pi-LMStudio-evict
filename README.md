@@ -87,6 +87,8 @@ Before each turn, the extension checks that the active model is still loaded and
 
 The check is one `lms ps` call (about 0.5 s) and is skipped when the model was confirmed loaded in the last 15 seconds, so rapid back-and-forth prompting doesn't pay for it. When a reload is needed the turn waits for it, capped at 5 minutes, after which the prompt goes through and LM Studio just-in-time loads the model itself.
 
+With a context length configured, the heal also replaces a copy loaded at the wrong context (see **Context length**).
+
 Turn it off with `healEvictions: false`.
 
 ## Context length
@@ -95,7 +97,7 @@ LM Studio loads a model at its own per-model default unless told otherwise, and 
 
 Every load this extension performs can pass `--context-length`. The value comes from, in order:
 
-1. the `contextWindow` of a **hand-written** `models.json` entry for that model (any `lmstudio*` provider), when `matchContextWindow` is on. pi then really gets the window it budgets for. Generated entries are skipped: theirs is the model's *maximum* context, which can be 256k and more than the machine can hold;
+1. the `contextWindow` of a **hand-written** `models.json` entry for that model (any `lmstudio*` provider), when `matchContextWindow` is on (off by default, since it changes how existing entries load). pi then really gets the window it budgets for. Generated entries are skipped: theirs is the model's *maximum* context, which can be 256k and more than the machine can hold;
 2. the global `contextLength` setting;
 3. nothing: LM Studio's default, as before.
 
@@ -180,7 +182,7 @@ Settings live in `<agent dir>/extensions/pi-lmstudio-evict/config.json` (usually
 | `autoRegisterModels` | `true` | Keep `models.json` in step with LM Studio's catalogue. |
 | `useMemoryEstimate` | `true` | Size models in the picker via `lms load --estimate-only` instead of file size. |
 | `contextLength` | *(unset)* | Passed as `--context-length` to every load, for models without a hand-written `contextWindow`. See **Context length**. |
-| `matchContextWindow` | `true` | Load at the `contextWindow` of a hand-written `models.json` entry. |
+| `matchContextWindow` | `false` | Load at the `contextWindow` of a hand-written `models.json` entry. |
 | `extraLoadArgs` | *(unset)* | Extra `lms load` flags for every load, e.g. `["--gpu", "max", "--parallel", "2", "--speculative-draft-mtp"]`. See `lms load --help` for what your LM Studio supports; an unknown flag makes the load fail. Flags the extension sets itself (`--context-length`/`-c`, `--ttl`, `--identifier`, `--yes`/`-y`, `--estimate-only`) are dropped. |
 | `modelLoadArgs` | *(unset)* | Per-model extra flags, keyed by model key; added after `extraLoadArgs`. Config file only. |
 | `startServer` | `false` | Run `lms server start` when an LM Studio model is in use and the server is down: on session start, before a switch, and before the heal check. |
@@ -221,7 +223,7 @@ A full run is 110 tests and takes a few minutes, most of it real model loads. Wh
 | `models.json` policy | Synthetic catalogues for the ownership rules, then the real catalogue validated by pi's own schema loader |
 | Extension loading | Imported through pi's bundled jiti, the way pi does it |
 
-One test is opt-in and reports itself as skipped unless you enable it: the negative guardrail verdict ("this model will fail to load based on your resource guardrails settings"). LM Studio only produces that verdict from its own guardrail setting, which lives in the desktop app's settings file and can't be set from the CLI, so the test temporarily edits that file (backed up first, restored in `finally` and again on process exit, and asserted byte-identical). Nothing else in the suite touches LM Studio's configuration, which is why this one asks for consent. To run all 110 with nothing skipped:
+One test is opt-in and reports itself as skipped unless you enable it: the negative guardrail verdict ("this model will fail to load based on your resource guardrails settings"). LM Studio only produces that verdict from its own guardrail setting, which lives in the desktop app's settings file and can't be set from the CLI, so the test temporarily edits that file (backed up first, restored in `finally` and again on process exit, and asserted byte-identical). Nothing else in the suite touches LM Studio's configuration, which is why this one asks for consent. One test does briefly stop and restart LM Studio's local server, to prove `startServer`; it restarts it in a `finally` if it was running, but any other client of the server sees a few seconds of downtime. To run all 110 with nothing skipped:
 
 ```bash
 PI_LMSTUDIO_EVICT_TEST_GUARDRAILS=1 npm test          # bash

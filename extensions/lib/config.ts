@@ -58,7 +58,8 @@ export interface EvictConfig {
 	contextLength?: number;
 	/**
 	 * Load a model at the `contextWindow` of its hand-written `models.json`
-	 * entry, so LM Studio really serves the window pi budgets for. Entries this
+	 * entry, so LM Studio really serves the window pi budgets for. Off by
+	 * default, because it changes how existing hand-written entries load. Entries this
 	 * extension generated are skipped: theirs is the model's *maximum*
 	 * context, which can be 256k and more than the machine can hold.
 	 */
@@ -99,7 +100,7 @@ export const DEFAULTS: Required<
 	multiSessionSafety: true,
 	autoRegisterModels: true,
 	useMemoryEstimate: true,
-	matchContextWindow: true,
+	matchContextWindow: false,
 	startServer: false,
 	unloadOnQuit: false,
 	stopServerOnQuit: false,
@@ -174,7 +175,7 @@ const OWNED_FLAGS: ReadonlyMap<string, boolean> = new Map([
 
 /**
  * The user's extra flags for `modelKey`, with the ones in `OWNED_FLAGS`
- * (and their values, in both `--flag value` and `--flag=value` form) removed.
+ * (and their values, in `--flag value`, `--flag=value` and `-c4096` form) removed.
  * Non-string entries are ignored; config is hand-editable JSON.
  */
 export function extraArgsFor(modelKey: string, config: EvictConfig): string[] {
@@ -185,13 +186,16 @@ export function extraArgsFor(modelKey: string, config: EvictConfig): string[] {
 
 	const kept: string[] = [];
 	for (let i = 0; i < raw.length; i++) {
-		const flag = raw[i].split("=")[0];
+		const arg = raw[i];
+		const flag = arg.split("=")[0];
 		const takesValue = OWNED_FLAGS.get(flag);
 		if (takesValue === undefined) {
-			kept.push(raw[i]);
+			// `-c4096`: a short flag with its value attached, as commander allows.
+			const short = !arg.startsWith("--") && arg.length > 2 ? arg.slice(0, 2) : undefined;
+			if (!(short && OWNED_FLAGS.get(short))) kept.push(arg);
 			continue;
 		}
-		if (takesValue && !raw[i].includes("=")) i++; // skip its value too
+		if (takesValue && !arg.includes("=")) i++; // skip its value too
 	}
 	return kept;
 }
@@ -243,7 +247,11 @@ export function contextLengthFor(
  * rather than looked up here, so this stays a pure function of its inputs;
  * callers get it from `contextLengthFor()`.
  */
-export function loadArgs(modelKey: string, config: EvictConfig = loadConfig(), contextLength?: number): string[] {
+export function loadArgs(
+	modelKey: string,
+	config: EvictConfig = loadConfig(),
+	contextLength?: number,
+): string[] {
 	const args = ["load", modelKey, "--yes"];
 	const ttl = config.ttlSeconds;
 	if (typeof ttl === "number" && Number.isFinite(ttl) && ttl > 0) {
