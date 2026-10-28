@@ -90,11 +90,16 @@ export function isResident(loaded: LoadedModel[], modelKey: string): boolean {
  *
  * The cost, on 0.3.x only: a copy loaded at the wrong context and never used
  * is left alone until its first turn; the next turn then fixes it.
+ *
+ * A request above the model's `maxContextLength` counts as met at either
+ * value: 0.4.25 reports the requested context as is, but a build that caps
+ * it would otherwise look wrong forever, and be reloaded on every turn.
  */
 export function hasWrongContext(entry: LoadedModel, contextLength: number | undefined): boolean {
 	if (contextLength === undefined || entry.contextLength === undefined) return false;
 	if (entry.lastUsedTime == null) return false;
-	return entry.contextLength !== contextLength;
+	if (entry.contextLength === contextLength) return false;
+	return !(entry.maxContextLength && entry.contextLength === Math.min(contextLength, entry.maxContextLength));
 }
 
 /** Is `modelKey` resident at a context we can use? */
@@ -346,6 +351,13 @@ export interface HealOutcome {
  * wrong context length (typically a just-in-time load at LM Studio's small
  * default). Reloading without unloading first would leave a `key:2` copy.
  */
+/**
+ * Wrong-context reloads that failed in this process, keyed by the exact
+ * `lms load` arguments, so a fixed config (another context, other extra
+ * flags) is tried again.
+ */
+const failedReloads = new Set<string>();
+
 export async function healIfEvicted(options: HealOptions): Promise<HealOutcome> {
 	const started = Date.now();
 	const config = options.config ?? loadResolvedConfig();
@@ -376,11 +388,15 @@ export async function healIfEvicted(options: HealOptions): Promise<HealOutcome> 
 			(entry) => matchesModelKey(entry, modelKey) && hasWrongContext(entry, contextLength),
 		);
 		const wrongContext = stale.length > 0;
+		const args = loadArgs(modelKey, config, contextLength);
+		const attempt = args.join(" ");
 		if (wrongContext) {
 			const claimed = config.multiSessionSafety ? claimedByOthers(sessionId) : new Set<string>();
 			// Another session is using this copy as it is, or the lock was taken
-			// from us: unloading now could cut off a response. Leave it.
-			if (claimed.has(modelKey) || (handle && !handle.isValid())) {
+			// from us: unloading now could cut off a response. Leave it. Same
+			// when this exact load already failed: unloading a working copy
+			// only to fail again would repeat on every turn.
+			if (claimed.has(modelKey) || (handle && !handle.isValid()) || failedReloads.has(attempt)) {
 				return {
 					checked: true,
 					wasEvicted: false,
@@ -397,7 +413,9 @@ export async function healIfEvicted(options: HealOptions): Promise<HealOutcome> 
 		// `keepAlive` because this is awaited and the caller acts on the
 		// result: the turn is being held open for it. Without it the host can
 		// exit the instant its event loop empties, mid-load.
-		const ok = await lmsBackground(loadArgs(modelKey, config, contextLength), { keepAlive: true });
+		const ok = await lmsBackground(args, { keepAlive: true });
+		if (ok) failedReloads.delete(attempt);
+		else if (wrongContext) failedReloads.add(attempt);
 		progress("done");
 		return {
 			checked: true,

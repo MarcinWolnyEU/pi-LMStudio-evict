@@ -418,6 +418,33 @@ test("context: heal replaces a copy loaded at the wrong context", { timeout: LON
 	);
 });
 
+test("context: a wrong-context reload that failed is not retried", { timeout: LONG_TIMEOUT_MS }, async (t) => {
+	const { small } = await preflight();
+	const target = small[0].modelKey;
+	const broken = { ...DEFAULTS, extraLoadArgs: ["--definitely-not-a-flag"] };
+	await resetLmStudio();
+	assert.ok(await lmsRun(["load", target, "--yes", "--context-length", "4096"]), "setup load failed");
+
+	const first = await timed(t, "heal with a broken flag", () =>
+		healIfEvicted({ modelKey: target, sessionId: SESSION, contextLength: 16_384, config: broken }),
+	);
+	assert.equal(first.wrongContext, true);
+	assert.equal(first.ok, false, "lms rejects the unknown flag");
+
+	// What pi's next request leaves behind: a just-in-time copy at the default.
+	assert.ok(await lmsRun(["load", target, "--yes", "--context-length", "4096"]), "second setup load failed");
+	const second = await healIfEvicted({ modelKey: target, sessionId: SESSION, contextLength: 16_384, config: broken });
+	assert.equal(second.wrongContext, true);
+	assert.equal(second.reloaded, false, "the same failing load is not tried again");
+	assert.deepEqual(await copiesOf(target), [`${target}@4096`], "the working copy was left alone");
+
+	// A fixed config is a different load, so it is tried.
+	const fixed = await healIfEvicted({ modelKey: target, sessionId: SESSION, contextLength: 16_384, config: DEFAULTS });
+	assert.equal(fixed.reloaded, true);
+	assert.equal(fixed.ok, true);
+	assert.deepEqual(await copiesOf(target), [`${target}@16384`]);
+});
+
 test(
 	"context: heal leaves a wrong-context copy that another live session claims",
 	{ timeout: LONG_TIMEOUT_MS },

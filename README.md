@@ -68,7 +68,7 @@ Then `/reload` in pi, or restart it.
 | `--model lmstudio/...` on the command line | Same |
 | Prompt sent while the active model is no longer loaded | Reload it first (see **Healing**) |
 | Prompt sent while the active model is loaded at the wrong context | Unload it, then reload it at the right one (see **Context length**) |
-| Session start | Sync `models.json` with LM Studio's catalogue; start the server if `startServer` is on. On a fresh start (not resume) on an LM Studio model, unload what should go and preload it, as a switch would: pi fires no `model_select` for the model it starts on |
+| Session start | Sync `models.json` with LM Studio's catalogue; start the server if `startServer` is on. When pi starts on an LM Studio model (including `pi -c` / `pi --resume` from the command line; not the in-app `/resume`, `/new` or `/fork`), unload what should go and preload it, as a switch would: pi fires no `model_select` for the model it starts on |
 | pi quits normally | Unload this session's model if `unloadOnQuit` is on and no other live session claims it; stop the server if `stopServerOnQuit` is on and this was the last session |
 | Session restore picking an LM Studio model | No-op (would force a redundant reload) |
 | Reselecting the same model | No-op, and never a second copy (see below) |
@@ -183,7 +183,7 @@ Settings live in `<agent dir>/extensions/pi-lmstudio-evict/config.json` (usually
 | `useMemoryEstimate` | `true` | Size models in the picker via `lms load --estimate-only` instead of file size. |
 | `contextLength` | *(unset)* | Passed as `--context-length` to every load, for models without a hand-written `contextWindow`. See **Context length**. |
 | `matchContextWindow` | `false` | Load at the `contextWindow` of a hand-written `models.json` entry. |
-| `extraLoadArgs` | *(unset)* | Extra `lms load` flags for every load, e.g. `["--gpu", "max", "--parallel", "2", "--speculative-draft-mtp"]`. See `lms load --help` for what your LM Studio supports; an unknown flag makes the load fail. Flags the extension sets itself (`--context-length`/`-c`, `--ttl`, `--identifier`, `--yes`/`-y`, `--estimate-only`) are dropped. |
+| `extraLoadArgs` | *(unset)* | Extra `lms load` flags for every load, e.g. `["--gpu", "max", "--parallel", "2", "--speculative-draft-mtp"]`. See `lms load --help` for what your LM Studio supports; an unknown flag makes the load fail. Flags the extension sets itself (`--context-length`/`-c`, `--ttl`, `--identifier`, `--yes`/`-y`, `--estimate-only`, `--host`, `--port`) are dropped. |
 | `modelLoadArgs` | *(unset)* | Per-model extra flags, keyed by model key; added after `extraLoadArgs`. Config file only. |
 | `startServer` | `false` | Run `lms server start` when an LM Studio model is in use and the server is down: on session start, before a switch, and before the heal check. |
 | `unloadOnQuit` | `false` | On a normal quit, unload this session's model unless another live session claims it. |

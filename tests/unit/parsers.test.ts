@@ -187,6 +187,16 @@ test("hasWrongContext: a copy that may still be loading is never judged", () => 
 	assert.equal(hasWrongContext(sized("alpha", 8192, true), 32768), true);
 });
 
+test("hasWrongContext: a request above the model's maximum is met at either value", () => {
+	const capped = (contextLength: number): LoadedModel => ({ ...sized("alpha", contextLength), maxContextLength: 8192 });
+	// 0.4.25 reports the request as is; a build that capped it must not look
+	// wrong forever, or the heal would reload the model on every turn.
+	assert.equal(hasWrongContext(capped(32768), 32768), false, "reported as requested");
+	assert.equal(hasWrongContext(capped(8192), 32768), false, "capped at the maximum");
+	assert.equal(hasWrongContext(capped(4096), 32768), true, "below both is still wrong");
+	assert.equal(hasWrongContext(capped(8192), 4096), true, "a request under the maximum gets no slack");
+});
+
 test("isUsable: resident at the wanted context, or resident with nothing wanted", () => {
 	assert.equal(isUsable([sized("alpha", 4096)], "alpha", undefined), true);
 	assert.equal(isUsable([sized("alpha", 4096)], "alpha", 32768), false);
@@ -341,6 +351,8 @@ test("extraArgsFor: drops flags the extension owns, with their values", () => {
 			"--identifier", "mine",
 			"--estimate-only",
 			"-y",
+			"--host", "other-box",
+			"--port=1235",
 			"--parallel", "4",
 		],
 	};

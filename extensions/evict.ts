@@ -83,6 +83,12 @@ const RESIDENCY_CACHE_MS = 15_000;
  */
 const HEAL_WAIT_MS = 5 * 60_000;
 
+/**
+ * Cap on how long quitting waits for `unloadOnQuit`/`stopServerOnQuit`. An
+ * unload takes a second or two; past this LM Studio is stuck, and pi exits.
+ */
+const QUIT_BUDGET_MS = 10_000;
+
 /** Budget for collecting `--estimate-only` figures before opening the picker. */
 const ESTIMATE_BUDGET_MS = 12_000;
 const ESTIMATE_CONCURRENCY = 4;
@@ -171,7 +177,9 @@ export default function (pi: ExtensionAPI) {
 		claim(modelKey);
 		// pi fires no `model_select` for the model it starts on (`--model`, or
 		// the default from settings), so this is where a fresh process applies
-		// the switch policy. Not on resume/fork/new/reload: like a restore,
+		// the switch policy (`pi -c`/`--resume` on the command line also arrive
+		// as "startup", after pi restored the session's model). Not on the
+		// in-app resume/fork/new/reload: like a restore,
 		// that continues a model the user already had. Neither path is awaited:
 		// a cold server start can take a while, and startup must not wait for
 		// it — the first turn's heal does, through the same lock.
@@ -206,8 +214,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (event) => {
 		dropClaim(sessionId);
 		if (event.reason !== "quit") return;
+		// pi awaits this handler, and each `lms` call has its own long timeout:
+		// a stuck LM Studio must not hold the quit for minutes. Past the
+		// budget pi exits; ttlSeconds still bounds whatever stays loaded.
+		const budget = new Promise<void>((resolve) => setTimeout(resolve, QUIT_BUDGET_MS).unref());
 		try {
-			await releaseOnQuit({ modelKey: heldModelKey, sessionId });
+			await Promise.race([releaseOnQuit({ modelKey: heldModelKey, sessionId }), budget]);
 		} catch {
 			// Quitting must never fail because LM Studio did.
 		}
@@ -594,14 +606,15 @@ export default function (pi: ExtensionAPI) {
 				},
 			},
 			{
-				label: config.extraLoadArgs?.length
+				// config.json is hand-editable: "--gpu max" as one string must not break the menu.
+				label: Array.isArray(config.extraLoadArgs) && config.extraLoadArgs.length
 					? `Extra load flags: ${config.extraLoadArgs.join(" ")}`
 					: "Extra load flags: none",
 				apply: async () => {
 					const stored = loadConfig();
 					const raw = await ctx.ui.input(
 						"Extra `lms load` flags, space-separated (e.g. --gpu max --parallel 2); empty = none",
-						stored.extraLoadArgs?.join(" ") ?? "",
+						Array.isArray(stored.extraLoadArgs) ? stored.extraLoadArgs.join(" ") : "",
 					);
 					if (raw === undefined) return;
 					const args = raw.trim().split(/\s+/).filter(Boolean);
