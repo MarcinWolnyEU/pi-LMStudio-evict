@@ -68,11 +68,19 @@ export interface EvictConfig {
 	 * Extra `lms load` flags for every load this extension performs, e.g.
 	 * `["--gpu", "max", "--parallel", "2", "--speculative-draft-mtp"]` — see
 	 * `lms load --help` for what your LM Studio supports. Flags the extension
-	 * sets itself are dropped (see `OWNED_FLAGS`).
+	 * sets itself are dropped (see `OWNED_FLAGS`). A single string is split the
+	 * way `tokenizeArgs` does, so `"--gpu max"` works too.
 	 */
-	extraLoadArgs?: string[];
+	extraLoadArgs?: string[] | string;
 	/** Per-model extra `lms load` flags, keyed by model key; added after `extraLoadArgs`. */
-	modelLoadArgs?: Record<string, string[]>;
+	modelLoadArgs?: Record<string, string[] | string>;
+	/**
+	 * When pi starts on an LM Studio model (`--model`, the settings default, `pi -c`),
+	 * apply the switch policy to it: evict every model no other session claims,
+	 * then preload it. Off by default, because it unloads models other apps
+	 * loaded, every time pi starts. A `/model` switch always applies the policy.
+	 */
+	preloadOnStartup?: boolean;
 	/**
 	 * Start LM Studio's local server (`lms server start`) when an LM Studio
 	 * model is in use and the server is down. Off by default: starting a
@@ -101,6 +109,7 @@ export const DEFAULTS: Required<
 	autoRegisterModels: true,
 	useMemoryEstimate: true,
 	matchContextWindow: false,
+	preloadOnStartup: false,
 	startServer: false,
 	unloadOnQuit: false,
 	stopServerOnQuit: false,
@@ -164,6 +173,10 @@ export function saveConfig(config: EvictConfig): void {
  * (and with it the `key:2` duplicate guard), `--estimate-only` loads nothing,
  * `--host`/`--port` (in `lms` builds that have them) would load on another
  * LM Studio while `lms ps` and `unload` still talk to this one.
+ *
+ * `--auto` is not in this map: it is the user's to set, except that `lms`
+ * rejects it together with `--context-length`, so `extraArgsFor` drops it
+ * when a context length is passed.
  */
 const OWNED_FLAGS: ReadonlyMap<string, boolean> = new Map([
 	["--yes", false],
@@ -178,35 +191,112 @@ const OWNED_FLAGS: ReadonlyMap<string, boolean> = new Map([
 ]);
 
 /**
- * The user's extra flags for `modelKey`, with the ones in `OWNED_FLAGS`
- * (and their values, in `--flag value`, `--flag=value` and `-c4096` form) removed.
- * Non-string entries are ignored; config is hand-editable JSON.
+ * Split a flag string the way a shell would, minus escapes: double and single
+ * quotes group, are stripped, and glue to adjacent text (`--flag="a b"` is
+ * `--flag=a b`). A backslash is an ordinary character, because Windows paths
+ * are full of them. An unterminated quote runs to the end of the text.
  */
-export function extraArgsFor(modelKey: string, config: EvictConfig): string[] {
-	const raw = [
-		...(Array.isArray(config.extraLoadArgs) ? config.extraLoadArgs : []),
-		...(Array.isArray(config.modelLoadArgs?.[modelKey]) ? config.modelLoadArgs[modelKey] : []),
-	].filter((arg): arg is string => typeof arg === "string" && arg !== "");
+export function tokenizeArgs(text: string): string[] {
+	const out: string[] = [];
+	let current = "";
+	let started = false; // distinguishes an empty quoted token ("") from no token
+	let quote: string | undefined;
+	for (const ch of text) {
+		if (quote) {
+			if (ch === quote) quote = undefined;
+			else current += ch;
+		} else if (ch === '"' || ch === "'") {
+			quote = ch;
+			started = true;
+		} else if (/\s/.test(ch)) {
+			if (started) out.push(current);
+			current = "";
+			started = false;
+		} else {
+			current += ch;
+			started = true;
+		}
+	}
+	if (started) out.push(current);
+	return out;
+}
+
+/** The inverse of `tokenizeArgs`: quote what needs it, join with spaces. */
+export function formatArgs(args: readonly string[]): string {
+	return args.map(quoteArg).join(" ");
+}
+
+function quoteArg(arg: string): string {
+	if (arg !== "" && !/[\s"']/.test(arg)) return arg;
+	if (!arg.includes('"')) return `"${arg}"`;
+	if (!arg.includes("'")) return `'${arg}'`;
+	// Both kinds inside: no escapes exist, so close the quotes around each `"`.
+	return `"${arg.replaceAll('"', `"'"'"`)}"`;
+}
+
+/**
+ * A flag list as written in config.json: an array, or one string to tokenize.
+ * Anything else, and non-string array entries, are ignored.
+ */
+export function argList(value: unknown): string[] {
+	if (typeof value === "string") return tokenizeArgs(value);
+	return Array.isArray(value) ? value.filter((arg): arg is string => typeof arg === "string") : [];
+}
+
+/**
+ * The user's extra flags for `modelKey`, with the ones in `OWNED_FLAGS`
+ * (and their values, in `--flag value`, `--flag=value`, `-c4096` and combined `-yc2048` form) removed.
+ * Non-string entries are ignored and a lone string is tokenized; config is
+ * hand-editable JSON.
+ *
+ * `withContextLength`: `loadArgs` is passing `--context-length`, so `--auto`
+ * goes too. `lms load --auto -c 4096` exits 1 ("option '--auto' cannot be used
+ * with option '-c, --context-length'"), which would fail every load.
+ */
+export function extraArgsFor(modelKey: string, config: EvictConfig, withContextLength = false): string[] {
+	const raw = [...argList(config.extraLoadArgs), ...argList(config.modelLoadArgs?.[modelKey])].filter(
+		(arg) => arg !== "",
+	);
 
 	const kept: string[] = [];
 	for (let i = 0; i < raw.length; i++) {
 		const arg = raw[i];
-		const flag = arg.split("=")[0];
-		const takesValue = OWNED_FLAGS.get(flag);
-		if (takesValue === undefined) {
-			// `-c4096`: a short flag with its value attached, as commander allows.
-			const short = !arg.startsWith("--") && arg.length > 2 ? arg.slice(0, 2) : undefined;
-			if (!(short && OWNED_FLAGS.get(short))) kept.push(arg);
+		if (arg.startsWith("--")) {
+			const flag = arg.split("=")[0];
+			if (withContextLength && flag === "--auto") continue;
+			const takesValue = OWNED_FLAGS.get(flag);
+			if (takesValue === undefined) kept.push(arg);
+			else if (takesValue && !arg.includes("=")) i++; // skip its value too
 			continue;
 		}
-		if (takesValue && !arg.includes("=")) i++; // skip its value too
+		const owned = arg.startsWith("-") ? ownedShort(arg) : undefined;
+		if (!owned) kept.push(arg);
+		else if (owned.valueFollows) i++;
 	}
 	return kept;
 }
 
-/** A positive whole number of tokens, or undefined. */
+/**
+ * Whether a single-dash arg contains a short flag the extension owns, read
+ * the way commander reads it: `-yc2048` is `-y -c 2048`, `-c4096` is `-c`
+ * with its value attached. Undefined when no letter is owned (this includes
+ * values such as `-1` and `-0.5`). `valueFollows`: the last owned letter takes
+ * a value and nothing follows it in this arg, so the next arg is that value.
+ */
+function ownedShort(arg: string): { valueFollows: boolean } | undefined {
+	let last = -1;
+	for (let i = 1; i < arg.length; i++) {
+		if (OWNED_FLAGS.has(`-${arg[i]}`)) last = i;
+	}
+	if (last < 0) return undefined;
+	return { valueFollows: OWNED_FLAGS.get(`-${arg[last]}`) === true && last === arg.length - 1 };
+}
+
+/** A whole number of tokens, at least 1, or undefined. Fractions round down; 0.5 is not a context. */
 function tokens(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	const whole = Math.floor(value);
+	return whole >= 1 ? whole : undefined;
 }
 
 /**
@@ -263,6 +353,6 @@ export function loadArgs(
 	}
 	const context = tokens(contextLength);
 	if (context) args.push("--context-length", String(context));
-	args.push(...extraArgsFor(modelKey, config));
+	args.push(...extraArgsFor(modelKey, config, context !== undefined));
 	return args;
 }

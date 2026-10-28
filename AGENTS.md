@@ -27,11 +27,17 @@ pi-lmstudio-evict/
     │   ├── parsers.test.ts         pure functions, no LM Studio
     │   ├── find-pi.test.ts         managed-install discovery, version validation, launcher / PI_MANAGED_INSTALL_ROOT lookup
     │   ├── loading.test.ts         withLoader / withStatus against a fake pi context
-    │   └── lms-binary.test.ts      lmsBinary() resolution order, each case in a fresh child process
+    │   ├── context-mismatch.test.ts  a load that exits 0 at the wrong context is recorded, not looped on
+    │   ├── busy-copy.test.ts       a copy serving a request is never unloaded (heal and switch)
+    │   ├── lms-binary.test.ts      lmsBinary() resolution order, each case in a fresh child process
+    │   ├── reload-backoff.test.ts  failed-fix memory expires after RELOAD_RETRY_MS (mock.timers)
+    │   ├── server-start.test.ts    ensureServer attempts, against a mocked lms.ts
+    │   └── unload-failure.test.ts  a failed unload must not be followed by a load (no `key:2`)
     ├── support/
     │   ├── app-child.ts            headless stand-in for a pi session
     │   ├── barrier.ts              cross-process rendezvous (ordering, not sleeps)
     │   ├── event-log.ts            append-only critical-section log + checker
+    │   ├── fake-lms.ts             mock.module stand-in for lms.ts (needs --experimental-test-module-mocks)
     │   └── find-pi.ts              locates pi across every install layout
     └── integration/
         ├── harness.ts                  preflight, timing, throwaway agent dir
@@ -54,7 +60,7 @@ There is no build step; pi loads `.ts` directly via jiti. There are no `node_mod
 
 | Event | What happens |
 |---|---|
-| `session_start` | Prune dead claims, write this session's claim, `ensureServer` (when on an LM Studio model); on `reason: "startup"` only (which pi 1.4 also uses for `pi -c` / `--resume` on the command line — only the in-app `/resume` says `resume`), `evictThenPreload` in a floating task — pi 1.4 emits **no** `model_select` for the model a process starts on (`--model` or the settings default; verified with a probe extension in print mode); reconcile `models.json`, `modelRegistry.refresh()` |
+| `session_start` | Prune dead claims, write this session's claim, `ensureServer` (when on an LM Studio model); on `reason: "startup"` only (which pi 1.4 also uses for `pi -c` / `--resume` on the command line — only the in-app `/resume` says `resume`), and only when `preloadOnStartup` is on (default off, since the policy evicts models other apps loaded), `evictThenPreload` in a floating task — pi 1.4 emits **no** `model_select` for the model a process starts on (`--model` or the settings default; verified with a probe extension in print mode); reconcile `models.json`, `modelRegistry.refresh()` |
 | `model_select` | Update the claim; unless restore / same-model / mid-stream, run `ensureServer` then `evictThenPreload` in a floating task |
 | `before_agent_start` | Past the residency cache: `ensureServer`, then heal — if the active model is not resident at the wanted context, (unload and) reload it **before** the turn proceeds |
 | `session_shutdown` | Drop this session's claim; on `reason: "quit"` only, `releaseOnQuit` |
@@ -65,23 +71,25 @@ There is no build step; pi loads `.ts` directly via jiti. There are no `node_mod
 
 Both take the cross-process lock, and both are exported so the integration tests drive the real code rather than a copy of it.
 
-- `evictThenPreload({ modelKey, sessionId })` — plan the eviction, unload the victims, then load the target if it isn't already resident. Strictly sequenced: loading before the unload finishes would briefly hold two models, or let `unload --all` kill the load in flight.
-- `healIfEvicted({ modelKey, sessionId })` — cheap `lms ps` check; if the model is gone, take the lock, **re-check** (another session may have loaded it while we queued), then load. Deliberately narrow: it reloads the target and evicts nothing else, because surprise unloads at prompt time are worse than a stray resident model. The next switch applies the full policy. The one unload it does is of the target itself when it is resident at the wrong context (unless another session claims it), and only after re-checking inside the lock.
+- `evictThenPreload({ modelKey, sessionId })` — plan the eviction, unload the victims, then load the target if it isn't already resident. Strictly sequenced: loading before the unload finishes would briefly hold two models, or let `unload --all` kill the load in flight. If an unload fails, it lists again and loads only when no copy of the target remains (`outcome.unloadFailed` otherwise): a load beside a copy that would not go makes `key:2`.
+- `healIfEvicted({ modelKey, sessionId })` — cheap `lms ps` check; if the model is gone, take the lock, **re-check** (another session may have loaded it while we queued), then load. Deliberately narrow: it reloads the target and evicts nothing else, because surprise unloads at prompt time are worse than a stray resident model. The next switch applies the full policy. The one unload it does is of the target itself when it is resident at the wrong context (unless another session claims it, or a request is running on it — `isBusy`, below), and only after re-checking inside the lock. When that unload fails it lists again and does not load while a copy remains (`outcome.unloadFailed`, `ok: false`), and the failure is remembered like a failed reload (see Context length).
 
-`planEviction()` is pure and is where the policy lives: keep one instance of the target, keep everything another live session claimed, unload the rest (including surplus copies of the target). Given a `contextLength`, the instance kept must be at that context; a target copy at another context becomes a victim (unless claimed), and the target is reloaded.
+`planEviction()` is pure and is where the policy lives: keep one instance of the target, keep everything another live session claimed, unload the rest (including surplus copies of the target). Given a `contextLength`, the instance kept must be at that context; a target copy at another context becomes a victim (unless claimed, or busy with a request), and the target is reloaded.
 
 Two smaller sequences, both opt-in and both under the lock with a short `timeoutMs` (the body runs anyway past it):
 
-- `ensureServer()` — `lms server start` when `startServer` is on and `lms server status` says it is down; re-checks inside the lock. `lms ps`/`load` work without the server, pi's requests do not.
+- `ensureServer()` — `lms server start` when `startServer` is on and `lms server status` says it is down; re-checks inside the lock. `lms ps`/`load` work without the server, pi's requests do not. Up to 3 attempts of 60 s each (`SERVER_START_TIMEOUT_MS` in lms.ts), 2 s apart, with a `serverStatus()` re-check after each failure because a start that timed out may have worked. Resolves `"off" | "up" | "started" | "failed"`; `onAttempt` drives the footer line and `failed` the warning in `startServerIfDown` (evict.ts), which both the awaited `before_agent_start` path and the background startup/switch paths share.
 - `releaseOnQuit()` — on a real quit, unload this session's model unless another live session claims it (`unloadOnQuit`), and stop the server if no other pi session is alive (`stopServerOnQuit`). Not on `/new`, `/resume`, `/fork` or reload: the process carries on and would only load the model again. pi awaits the shutdown handler, so it is capped at `QUIT_BUDGET_MS` (10 s); a stuck LM Studio cannot hold the quit.
 
 ### Context length
 
 `contextLengthFor(modelKey, config)` (config.ts) decides the `--context-length`: a hand-written `contextWindow` under any `lmstudio*` provider in `models.json` (when `matchContextWindow`), then `contextLength`, else none. Generated entries are skipped on purpose — `toModelEntry` writes the model's *maximum* context there, and loading a 262k window blindly can exhaust memory. `loadArgs` takes the value as a parameter so it stays pure; the orchestrator resolves it.
 
-`hasWrongContext()` decides whether a resident copy must be replaced. It refuses to judge a copy whose `lastUsedTime` is null, because that copy may still be loading (see the measurement below), and unloading it would cut the load off. A request above the model's `maxContextLength` counts as met at either value: 0.4.25 accepts `-c 200000` on a 131072-max model and reports 200000 (measured), but a build that capped it would otherwise look wrong forever. A wrong-context reload that fails is remembered for the process, keyed by its exact `lms load` arguments, and not retried: unloading a working just-in-time copy only to fail again would repeat every turn. Changing the config changes the key, so a fix is tried.
+`hasWrongContext()` decides whether a resident copy must be replaced. It refuses to judge a copy whose `lastUsedTime` is null, because that copy may still be loading (see the measurement below), and unloading it would cut the load off. A request above the model's `maxContextLength` counts as met at either value: 0.4.25 accepts `-c 200000` on a 131072-max model and reports 200000 (measured), but a build that capped it would otherwise look wrong forever. A wrong-context fix that fails (the load, or the unload before it) is remembered with its time in `failedReloads`, keyed by its exact `lms load` arguments, and not retried for `RELOAD_RETRY_MS` (10 minutes): unloading a working just-in-time copy only to fail again would repeat every turn, but one temporary failure (memory still being freed, LM Studio busy) must not disable the fix for the whole pi session. Changing the config changes the key, so a fix is tried at once. A load that exits 0 can still come up at another context (a flag form the extension did not strip, a fractional value, a build that adjusts it), which would look wrong on every turn. So after a successful load at a requested context, the heal and the switch list again and compare with the same max-context rule but without the `lastUsedTime` gate, since our own `lms load` has returned and the load is complete. A copy that still differs is recorded like a failed fix and reported as `contextMismatch` (requested vs actual).
 
-`extraArgsFor()` appends `extraLoadArgs` and `modelLoadArgs[key]`, minus the flags the extension owns (`OWNED_FLAGS`): a user `--context-length` would defeat `hasWrongContext`, `--identifier` would break `matchesModelKey` and with it the `key:2` guard, and `--host`/`--port` (where a build has them) would load on another LM Studio than the one `lms ps` reads.
+`extraArgsFor()` appends `extraLoadArgs` and `modelLoadArgs[key]`, minus the flags the extension owns (`OWNED_FLAGS`): a user `--context-length` would defeat `hasWrongContext`, `--identifier` would break `matchesModelKey` and with it the `key:2` guard, and `--host`/`--port` (where a build has them) would load on another LM Studio than the one `lms ps` reads. `--auto` is dropped only when a context length is passed: `lms load --auto -c 4096` exits 1 (`option '--auto' cannot be used with option '-c, --context-length'`, CLI commit 1b7181b), so keeping it would fail every load. Single-dash args are read like commander does (`-yc2048` is `-y -c 2048`; `ownedShort`), because a hidden second `-c` wins over ours. Values like `-1` or `-0.5` contain no owned letter and pass.
+
+Flag lists may be an array or one string. `tokenizeArgs`/`formatArgs` (config.ts) are the shell-like splitter and its inverse used by the settings menu and by string values in config.json: quotes group and are stripped, quoted pieces glue to neighbours (`--flag="a b"` is `--flag=a b`), and `\` is **not** an escape, since Windows paths are full of them.
 
 ### Configuration
 
@@ -92,6 +100,7 @@ Two smaller sequences, both opt-in and both under the lock with a short `timeout
   "ttlSeconds": 900,
   "contextLength": 32768,
   "matchContextWindow": false,
+  "preloadOnStartup": false,
   "extraLoadArgs": ["--gpu", "max"],
   "modelLoadArgs": { "qwen/qwen3.5-9b": ["--parallel", "2"] },
   "startServer": false,
@@ -188,6 +197,16 @@ This is exactly what we want. A chat completion sent to a mid-load model returns
 The one visible artefact: the picker can momentarily render `ctx 8192/262144` for a model that is still loading. Cosmetic — don't trust `contextLength` from an entry that only just appeared.
 
 **LM Studio 0.4.25 (macOS) behaves differently**, measured by polling `lms ps --json` every 0.3 s through a `lms load -c 16384`: the entry appeared ~0.6 s in, reported `contextLength: 16384` (the *requested* value, no placeholder) for the whole load, and `lastUsedTime` stayed `null` until the instant the load completed, when it was set. So on 0.4.x `lastUsedTime == null` means "still loading", while on 0.3.x it meant "loading or never used". `hasWrongContext()` keys on it for that reason: on either version it never judges a copy that might be mid-load.
+
+### A request in flight: `status`, `queued`, `lastUsedTime`, and what `unload` does to a stream
+
+Measured on lms CLI 1.3.3 (commit 1b7181b), LM Studio app 1.1.7, llama.cpp CUDA runtime 2.65.1, Windows 11, with a streaming `/v1/chat/completions` request against a 12B model, polling `lms ps --json`:
+
+- `status` goes `"idle"` → `"processingPrompt"` → `"generating"` → `"idle"` during a request. `queued` counts requests waiting past the `parallel` limit. `/api/v0` and `/api/v1` show nothing about it. `isBusy()` treats a copy as busy when `status` is present and not `"idle"`, or `queued > 0`.
+- `lastUsedTime` holds the load time after a load, is `null` for the whole duration of a request, and is set to the completion time when the request ends. On this build the `lastUsedTime == null` guard in `hasWrongContext` therefore already protects a busy copy, by accident (it reads as "still loading"). On a build where it stays set during a request nothing would, which is why `isBusy` checks the status itself. The live test for this (`heal does not unload a wrong-context copy that is serving a request`) passes on this build with or without `isBusy`; the unit test `busy-copy.test.ts` is what covers the status check.
+- `lms unload` during a stream cuts the client off within about 1 s: an SSE `event: error` with `{"error":{"message":"Model unloaded by user or API request."}}` and no `[DONE]`.
+- Spawning overlapping `lms ps` calls quickly stalled generation for about 4 s. Poll sequentially and sparingly.
+- `lms load <key>` on an already-loaded model creates a second copy `<key>:2` (the same on these versions as on 0.3.x, above).
 
 ### `lms ps --json` reports `parallel`
 

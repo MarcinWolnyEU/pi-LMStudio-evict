@@ -65,15 +65,16 @@ Then `/reload` in pi, or restart it.
 |---------|--------|
 | `/model` to a different LM Studio model | Unload what should go, then preload the new model |
 | `Ctrl+P` cycling to a different LM Studio model | Same |
-| `--model lmstudio/...` on the command line | Same |
+| `--model lmstudio/...` on the command line | Same, but only with `preloadOnStartup` on; see the next row |
 | Prompt sent while the active model is no longer loaded | Reload it first (see **Healing**) |
 | Prompt sent while the active model is loaded at the wrong context | Unload it, then reload it at the right one (see **Context length**) |
-| Session start | Sync `models.json` with LM Studio's catalogue; start the server if `startServer` is on. When pi starts on an LM Studio model (including `pi -c` / `pi --resume` from the command line; not the in-app `/resume`, `/new` or `/fork`), unload what should go and preload it, as a switch would: pi fires no `model_select` for the model it starts on |
+| Session start | Sync `models.json` with LM Studio's catalogue; start the server if `startServer` is on. With `preloadOnStartup` on, when pi starts on an LM Studio model (including `pi -c` / `pi --resume` from the command line; not the in-app `/resume`, `/new` or `/fork`), unload what should go and preload it, as a switch would: pi fires no `model_select` for the model it starts on. With it off (the default), startup leaves LM Studio's models alone and the first prompt loads the model through the heal |
 | pi quits normally | Unload this session's model if `unloadOnQuit` is on and no other live session claims it; stop the server if `stopServerOnQuit` is on and this was the last session |
 | Session restore picking an LM Studio model | No-op (would force a redundant reload) |
 | Reselecting the same model | No-op, and never a second copy (see below) |
 | Switching to a non-LM-Studio model (Anthropic, OpenRouter, etc.) | No-op, and this session stops claiming a model |
 | `lms` missing, or local server down with `startServer` off | No-op, silent |
+| Local server down with `startServer` on | Up to three `lms server start` attempts, 60 s each, with `lmstudio: starting server (attempt n/3)…` in the footer. If it is still down, a warning says the request may fail |
 
 The switch itself is fire-and-forget. It runs in the background, so pi never blocks on a model load, and progress appears in the footer. The load starts only after the unload has finished; otherwise two large models could sit in memory at once.
 
@@ -101,7 +102,7 @@ Every load this extension performs can pass `--context-length`. The value comes 
 2. the global `contextLength` setting;
 3. nothing: LM Studio's default, as before.
 
-A model already loaded at a different context (typically a just-in-time load at the default) is unloaded and reloaded at the right one: by the heal before a turn, and by a model switch. It is unloaded **first**, so there is never a `<key>:2` copy. A copy is left alone when another live session claims it, and while it is still loading, so a load in flight is never cut off.
+A model already loaded at a different context (typically a just-in-time load at the default) is unloaded and reloaded at the right one: by the heal before a turn, and by a model switch. It is unloaded **first**, so there is never a `<key>:2` copy. A copy is left alone when another live session claims it, while it is still loading, and while any client (LM Studio's chat, another app) is mid-request on it, so neither a load nor a stream in flight is ever cut off; the next turn tries again. If the unload fails, nothing is loaded beside the old copy, you get a warning, and the fix is not retried for 10 minutes. If the reload succeeds but LM Studio comes up at another context than asked for (an adjusted value, a flag clash), you get a warning naming both, and it is not reloaded in a loop.
 
 ## Multiple pi sessions
 
@@ -162,6 +163,7 @@ Settings live in `<agent dir>/extensions/pi-lmstudio-evict/config.json` (usually
   "ttlSeconds": 900,
   "contextLength": 32768,
   "matchContextWindow": true,
+  "preloadOnStartup": false,
   "extraLoadArgs": ["--gpu", "max"],
   "modelLoadArgs": { "qwen/qwen3.5-9b": ["--parallel", "2"] },
   "startServer": true,
@@ -183,11 +185,14 @@ Settings live in `<agent dir>/extensions/pi-lmstudio-evict/config.json` (usually
 | `useMemoryEstimate` | `true` | Size models in the picker via `lms load --estimate-only` instead of file size. |
 | `contextLength` | *(unset)* | Passed as `--context-length` to every load, for models without a hand-written `contextWindow`. See **Context length**. |
 | `matchContextWindow` | `false` | Load at the `contextWindow` of a hand-written `models.json` entry. |
-| `extraLoadArgs` | *(unset)* | Extra `lms load` flags for every load, e.g. `["--gpu", "max", "--parallel", "2", "--speculative-draft-mtp"]`. See `lms load --help` for what your LM Studio supports; an unknown flag makes the load fail. Flags the extension sets itself (`--context-length`/`-c`, `--ttl`, `--identifier`, `--yes`/`-y`, `--estimate-only`, `--host`, `--port`) are dropped. |
+| `extraLoadArgs` | *(unset)* | Extra `lms load` flags for every load, e.g. `["--gpu", "max", "--parallel", "2", "--speculative-draft-mtp"]`. See `lms load --help` for what your LM Studio supports; an unknown flag makes the load fail. Flags the extension sets itself (`--context-length`/`-c`, `--ttl`, `--identifier`, `--yes`/`-y`, `--estimate-only`, `--host`, `--port`) are dropped, also when hidden in a combined short flag such as `-yc2048`, and so is `--auto` while a context length is being passed, because `lms` refuses the two together. |
 | `modelLoadArgs` | *(unset)* | Per-model extra flags, keyed by model key; added after `extraLoadArgs`. Config file only. |
+| `preloadOnStartup` | `false` | When pi starts on an LM Studio model, evict the models nothing else claims and preload it, as a `/model` switch does. Off by default, because it unloads models other apps loaded every time pi starts. |
 | `startServer` | `false` | Run `lms server start` when an LM Studio model is in use and the server is down: on session start, before a switch, and before the heal check. |
 | `unloadOnQuit` | `false` | On a normal quit, unload this session's model unless another live session claims it. |
 | `stopServerOnQuit` | `false` | On a normal quit, stop the server when no other pi session is alive. Other apps may use it, so think before turning it on. |
+
+`extraLoadArgs` and each `modelLoadArgs` value can also be one string, which is split like a shell would: `"--gpu max --engine-config-file \"C:\\Users\\John Doe\\cfg.json\""` in JSON (the quotes group words and are removed; a backslash is an ordinary character). The settings menu takes the same syntax and shows arguments with spaces in quotes.
 
 Everything is read fresh, so a change applies to the next operation without a reload.
 

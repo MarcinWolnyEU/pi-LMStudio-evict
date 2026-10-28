@@ -33,8 +33,14 @@ export interface LoadedModel {
 	quantization?: { name?: string; bits?: number };
 	vision?: boolean;
 	trainedForToolUse?: boolean;
-	/** "idle" when ready for inference. Presence in the array is the load signal. */
+	/**
+	 * "idle" when ready for inference. Presence in the array is the load signal.
+	 * During a request it goes "processingPrompt", then "generating", then back
+	 * to "idle" (LM Studio 0.4.x, lms 1.3.3).
+	 */
 	status?: string;
+	/** Requests waiting behind the model's `parallel` limit. */
+	queued?: number;
 }
 
 /** Entry of `lms ls --json` — a model present on disk. */
@@ -110,8 +116,12 @@ export function lmsBinary(): string {
 
 const JSON_TIMEOUT_MS = 15_000;
 const RUN_TIMEOUT_MS = 60_000;
-/** A cold `lms server start` may first have to boot the LM Studio service. */
-const SERVER_START_TIMEOUT_MS = 120_000;
+/**
+ * One `lms server start` attempt. A cold start may first have to boot the LM
+ * Studio service. `ensureServer` makes up to three attempts, so one hung
+ * attempt does not hold the turn for long.
+ */
+const SERVER_START_TIMEOUT_MS = 60_000;
 /** The estimate is a local calculation; it returns in well under a second. */
 const ESTIMATE_TIMEOUT_MS = 30_000;
 

@@ -557,6 +557,159 @@ test("quit: spares a claimed model, unloads an unclaimed one", { timeout: LONG_T
 	assert.deepEqual(off.unloaded, [], "nothing happens with the settings off");
 });
 
+/** A chat completion read as a stream, the way any other client of LM Studio would. */
+interface ChatStream {
+	/** True once the response has ended, however it ended. */
+	settled: boolean;
+	finishReason?: string;
+	/** Anything that is not a clean end: an SSE `event: error`, a non-200, a dropped connection. */
+	error?: string;
+	done: Promise<void>;
+	abort(): void;
+}
+
+function streamChat(port: number, model: string, maxTokens: number): ChatStream {
+	const controller = new AbortController();
+	const stream: ChatStream = { settled: false, done: Promise.resolve(), abort: () => controller.abort() };
+	stream.done = (async () => {
+		try {
+			const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				signal: controller.signal,
+				body: JSON.stringify({
+					model,
+					stream: true,
+					max_tokens: maxTokens,
+					temperature: 0.8,
+					messages: [
+						{
+							role: "user",
+							content: "Count upward from 1, writing each number in words on its own line. Do not stop until you reach one thousand.",
+						},
+					],
+				}),
+			});
+			if (!response.ok || !response.body) {
+				stream.error = `HTTP ${response.status}`;
+				return;
+			}
+			const decoder = new TextDecoder();
+			let buffered = "";
+			for await (const chunk of response.body) {
+				buffered += decoder.decode(chunk, { stream: true });
+				let newline: number;
+				while ((newline = buffered.indexOf("\n")) >= 0) {
+					const line = buffered.slice(0, newline).trim();
+					buffered = buffered.slice(newline + 1);
+					if (line === "event: error") stream.error = "SSE error event";
+					if (!line.startsWith("data:") || line.endsWith("[DONE]")) continue;
+					try {
+						const data = JSON.parse(line.slice(5)) as { error?: { message?: string }; choices?: { finish_reason?: string | null }[] };
+						if (data.error) stream.error = data.error.message ?? "error object";
+						const reason = data.choices?.[0]?.finish_reason;
+						if (reason) stream.finishReason = reason;
+					} catch {
+						// A partial or non-JSON line carries nothing we assert on.
+					}
+				}
+			}
+		} catch (error) {
+			stream.error = `stream failed: ${String(error)}`;
+		} finally {
+			stream.settled = true;
+		}
+	})();
+	return stream;
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Wait until `lms ps` shows `target` serving a request. One `lms ps` at a time,
+ * a few times a second: overlapping `lms` processes stalled generation for
+ * seconds when measured (AGENTS.md). Gives up when the stream ends or time runs out.
+ */
+async function waitUntilBusy(target: string, stream: ChatStream, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (!stream.settled && Date.now() < deadline) {
+		const entry = ((await listLoaded()) ?? []).find((e) => matchesModelKey(e, target));
+		if (entry?.status === "processingPrompt" || entry?.status === "generating") return true;
+		await sleep(300);
+	}
+	return false;
+}
+
+test(
+	"context: heal does not unload a wrong-context copy that is serving a request",
+	{ timeout: LONG_TIMEOUT_MS },
+	async (t) => {
+		const { small } = await preflight();
+		const target = small[0].modelKey;
+		const serverWasUp = (await serverStatus())?.running === true;
+		try {
+			if (!serverWasUp) assert.ok(await lmsRun(["server", "start"]), "could not start the server");
+			const port = (await serverStatus())?.port;
+			assert.ok(port, "the server reported no port");
+
+			// The stream can end before the heal runs (a tiny model that stops early
+			// or generates fast). That proves nothing, so try again, asking for more.
+			const attempts = [1500, 2500, 3000];
+			let verdict = "";
+			for (const [index, maxTokens] of attempts.entries()) {
+				await resetLmStudio();
+				assert.ok(await lmsRun(["load", target, "--yes", "--context-length", "4096"]), "setup load failed");
+
+				const stream = streamChat(port, target, maxTokens);
+				try {
+					if (!(await waitUntilBusy(target, stream, 60_000))) {
+						verdict = `attempt ${index + 1}: the stream ended before lms ps showed the copy busy`;
+						continue;
+					}
+					const endedBeforeHeal = stream.settled;
+					const outcome = await timed(t, "heal while a request is running", () =>
+						healIfEvicted({ modelKey: target, sessionId: SESSION, contextLength: 8192 }),
+					);
+					const copiesAfterHeal = await copiesOf(target);
+					const endedDuringHeal = stream.settled;
+
+					if (endedBeforeHeal || endedDuringHeal) {
+						verdict = `attempt ${index + 1}: the stream ended while the heal was running`;
+						continue;
+					}
+
+					// The request was running for the whole heal. What the heal reports
+					// depends on the build: where `lastUsedTime` is null during a request
+					// (lms 1.3.3) the copy is not judged at all, elsewhere it is judged
+					// wrong and skipped as busy. Either way it must be left alone.
+					t.diagnostic(`heal outcome: wrongContext ${outcome.wrongContext}, busy ${outcome.busy}`);
+					assert.equal(outcome.reloaded, false, "the heal reloaded a copy that was serving a request");
+					assert.deepEqual(copiesAfterHeal, [`${target}@4096`], "not unloaded, not duplicated");
+
+					await stream.done;
+					assert.equal(stream.error, undefined, "the stream was cut off");
+					assert.ok(stream.finishReason, "the stream ended without a finish_reason");
+					assert.deepEqual(await copiesOf(target), [`${target}@4096`], "still the same copy afterwards");
+					verdict = "";
+					break;
+				} finally {
+					stream.abort();
+					await stream.done;
+				}
+			}
+			assert.equal(verdict, "", `the heal never ran against a busy copy: ${verdict}. Use a model that generates longer.`);
+
+			// Idle again, the next heal is free to fix the context.
+			const fixed = await healIfEvicted({ modelKey: target, sessionId: SESSION, contextLength: 8192 });
+			assert.equal(fixed.reloaded, true);
+			assert.deepEqual(await copiesOf(target), [`${target}@8192`]);
+		} finally {
+			await resetLmStudio();
+			if (!serverWasUp) await stopServer();
+		}
+	},
+);
+
 test("server: ensureServer starts a stopped server, and only when asked", { timeout: 180_000 }, async (t) => {
 	const before = await serverStatus();
 	assert.ok(before, "lms server status must answer");
@@ -564,15 +717,15 @@ test("server: ensureServer starts a stopped server, and only when asked", { time
 		assert.ok(await stopServer(), "stop failed");
 		assert.equal((await serverStatus())?.running, false);
 
-		assert.equal(await ensureServer({ config: DEFAULTS }), undefined, "off by default");
+		assert.equal(await ensureServer({ config: DEFAULTS }), "off", "off by default");
 		assert.equal((await serverStatus())?.running, false);
 
 		const started = await timed(t, "ensureServer from stopped", () =>
 			ensureServer({ config: { ...DEFAULTS, startServer: true } }),
 		);
-		assert.equal(started, true);
+		assert.equal(started, "started");
 		assert.equal((await serverStatus())?.running, true);
-		assert.equal(await ensureServer({ config: { ...DEFAULTS, startServer: true } }), false, "already up");
+		assert.equal(await ensureServer({ config: { ...DEFAULTS, startServer: true } }), "up", "already up");
 	} finally {
 		// Leave the server as the suite found it.
 		if (before.running && !(await serverStatus())?.running) await lmsRun(["server", "start"]);

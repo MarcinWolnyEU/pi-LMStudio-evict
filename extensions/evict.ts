@@ -23,12 +23,15 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	type EvictConfig,
+	argList,
 	contextLengthFor,
+	formatArgs,
 	loadArgs,
 	loadConfig,
 	loadResolvedConfig,
 	modelsJsonPath,
 	saveConfig,
+	tokenizeArgs,
 } from "./lib/config.ts";
 import {
 	type CatalogModel,
@@ -44,6 +47,7 @@ import {
 import { CANCELLED, withLoader, withStatus } from "./lib/loading.ts";
 import { type Fit, fitOf, formatBytes, ram, vram } from "./lib/memory.ts";
 import {
+	type ContextMismatch,
 	bareModelKey,
 	duplicateIdentifiers,
 	ensureServer,
@@ -93,6 +97,11 @@ const QUIT_BUDGET_MS = 10_000;
 const ESTIMATE_BUDGET_MS = 12_000;
 const ESTIMATE_CONCURRENCY = 4;
 
+/** What to tell the user when a load worked but LM Studio used another context. */
+function contextMismatchMessage(modelKey: string, { requested, actual }: ContextMismatch): string {
+	return `${modelKey} loaded at ${actual} tokens instead of ${requested}; check extraLoadArgs/contextLength`;
+}
+
 export default function (pi: ExtensionAPI) {
 	// One identity per pi process, used to tell our own claim from other
 	// sessions' claims in the shared claims directory.
@@ -136,12 +145,28 @@ export default function (pi: ExtensionAPI) {
 	// Startup: catalogue sync and claim registration
 	// -----------------------------------------------------------------------
 
-	/** Start the server when the setting asks for it, and say so when it happened. */
+	/**
+	 * Start the server when the setting asks for it, and say what happened:
+	 * a footer line while it tries, a note when it started, a warning when it
+	 * is still down after every attempt (the request may then fail).
+	 */
 	const startServerIfDown = async (ctx: ExtensionContext) => {
+		let showing = false;
 		try {
-			if (await ensureServer()) ctx.ui.notify("Started the LM Studio server", "info");
+			const outcome = await ensureServer({
+				onAttempt: (attempt, of) => {
+					showing = true;
+					setStatus(ctx, `lmstudio: starting server (attempt ${attempt}/${of})…`);
+				},
+			});
+			if (showing) setStatus(ctx, undefined);
+			if (outcome === "started") ctx.ui.notify("Started the LM Studio server", "info");
+			else if (outcome === "failed") {
+				ctx.ui.notify("Could not start the LM Studio server; your request may fail", "warning");
+			}
 		} catch {
 			// Best effort, like every automatic path.
+			if (showing) setStatus(ctx, undefined);
 		}
 	};
 
@@ -165,6 +190,12 @@ export default function (pi: ExtensionAPI) {
 				});
 				setStatus(ctx, undefined);
 				if (outcome.alreadyResident || outcome.loaded) residentAt = Date.now();
+				if (outcome.unloadFailed) {
+					ctx.ui.notify(`Could not unload the old copy of ${modelKey}; keeping it as it is`, "warning");
+				}
+				if (outcome.contextMismatch) {
+					ctx.ui.notify(contextMismatchMessage(modelKey, outcome.contextMismatch), "warning");
+				}
 			} catch {
 				setStatus(ctx, undefined);
 			}
@@ -175,18 +206,20 @@ export default function (pi: ExtensionAPI) {
 		pruneDeadClaims();
 		const modelKey = activeModelKey(ctx);
 		claim(modelKey);
-		// pi fires no `model_select` for the model it starts on (`--model`, or
-		// the default from settings), so this is where a fresh process applies
-		// the switch policy (`pi -c`/`--resume` on the command line also arrive
-		// as "startup", after pi restored the session's model). Not on the
-		// in-app resume/fork/new/reload: like a restore,
-		// that continues a model the user already had. Neither path is awaited:
-		// a cold server start can take a while, and startup must not wait for
-		// it — the first turn's heal does, through the same lock.
-		if (modelKey && event.reason === "startup") preloadInBackground(ctx, modelKey);
-		else if (modelKey) void startServerIfDown(ctx);
-
 		const config = loadResolvedConfig();
+		// pi fires no `model_select` for the model it starts on (`--model`, or
+		// the default from settings), so this is where a fresh process can apply
+		// the switch policy (`pi -c`/`--resume` on the command line also arrive
+		// as "startup", after pi restored the session's model). Only with
+		// `preloadOnStartup`: it evicts models other apps may have loaded. Not
+		// on the in-app resume/fork/new/reload: like a restore, that continues
+		// a model the user already had. Neither path is awaited: a cold server
+		// start can take a while, and startup must not wait for it — the first
+		// turn's heal does, through the same lock.
+		if (modelKey && event.reason === "startup" && config.preloadOnStartup) {
+			preloadInBackground(ctx, modelKey);
+		} else if (modelKey) void startServerIfDown(ctx);
+
 		if (!config.autoRegisterModels) return;
 
 		const [catalog, server] = await Promise.all([listCatalog(), serverStatus()]);
@@ -299,14 +332,22 @@ export default function (pi: ExtensionAPI) {
 			const outcome = await Promise.race([heal, timeout]);
 			setStatus(ctx, undefined);
 			// Undefined means the cap expired; the model may still be loading.
-			if (outcome?.reloaded && !outcome.ok && outcome.wrongContext) {
+			if (outcome?.unloadFailed) {
+				// Nothing was loaded either: the old copy stays and serves the turn.
+				ctx.ui.notify(`Could not unload ${modelKey} to fix its context; keeping the current copy`, "warning");
+			} else if (outcome?.reloaded && !outcome.ok && outcome.wrongContext) {
 				// The wrong-context copy is already gone; say so rather than let
 				// the turn fail on a just-in-time load with no explanation.
 				ctx.ui.notify(`Unloaded ${modelKey} to fix its context, but the reload failed`, "warning");
 			}
+			// A request is running on the wrong-context copy: it was left alone, so
+			// don't cache this as settled; the next turn checks again.
+			if (outcome?.busy) return;
 			if (!outcome?.checked || !outcome.ok) return;
 			residentAt = Date.now();
-			if (outcome.reloaded && outcome.wrongContext) {
+			if (outcome.contextMismatch) {
+				ctx.ui.notify(contextMismatchMessage(modelKey, outcome.contextMismatch), "warning");
+			} else if (outcome.reloaded && outcome.wrongContext) {
 				const context = contextLengthFor(modelKey, config);
 				ctx.ui.notify(`${modelKey} was loaded at the wrong context — reloaded it at ${context}`, "info");
 			} else if (outcome.reloaded) {
@@ -595,8 +636,8 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("Context length off — LM Studio picks its default", "info");
 						return;
 					}
-					const length = Number.parseInt(trimmed, 10);
-					if (!Number.isFinite(length) || length <= 0) {
+					const length = Number(trimmed);
+					if (!Number.isInteger(length) || length <= 0) {
 						ctx.ui.notify(`Not a valid context length: ${trimmed}`, "error");
 						return;
 					}
@@ -607,22 +648,22 @@ export default function (pi: ExtensionAPI) {
 			},
 			{
 				// config.json is hand-editable: "--gpu max" as one string must not break the menu.
-				label: Array.isArray(config.extraLoadArgs) && config.extraLoadArgs.length
-					? `Extra load flags: ${config.extraLoadArgs.join(" ")}`
+				label: argList(config.extraLoadArgs).length
+					? `Extra load flags: ${formatArgs(argList(config.extraLoadArgs))}`
 					: "Extra load flags: none",
 				apply: async () => {
 					const stored = loadConfig();
 					const raw = await ctx.ui.input(
-						"Extra `lms load` flags, space-separated (e.g. --gpu max --parallel 2); empty = none",
-						Array.isArray(stored.extraLoadArgs) ? stored.extraLoadArgs.join(" ") : "",
+						'Extra `lms load` flags, space-separated; quote values that contain spaces (e.g. --gpu max --engine-config-file "C:\\my dir\\cfg.json"); empty = none',
+						formatArgs(argList(stored.extraLoadArgs)),
 					);
 					if (raw === undefined) return;
-					const args = raw.trim().split(/\s+/).filter(Boolean);
+					const args = tokenizeArgs(raw);
 					if (args.length === 0) delete stored.extraLoadArgs;
 					else stored.extraLoadArgs = args;
 					saveConfig(stored);
 					ctx.ui.notify(
-						args.length ? `Extra load flags: ${args.join(" ")}` : "Extra load flags cleared",
+						args.length ? `Extra load flags: ${formatArgs(args)}` : "Extra load flags cleared",
 						"info",
 					);
 				},
@@ -631,6 +672,11 @@ export default function (pi: ExtensionAPI) {
 				ctx,
 				"matchContextWindow",
 				`Match contextWindow: ${onOff(config.matchContextWindow)} — load at a hand-written window`,
+			),
+			toggle(
+				ctx,
+				"preloadOnStartup",
+				`Preload on startup: ${onOff(config.preloadOnStartup)} — evict the others and load the model pi starts on`,
 			),
 			toggle(
 				ctx,
@@ -684,6 +730,7 @@ export default function (pi: ExtensionAPI) {
 			| "autoRegisterModels"
 			| "useMemoryEstimate"
 			| "matchContextWindow"
+			| "preloadOnStartup"
 			| "startServer"
 			| "unloadOnQuit"
 			| "stopServerOnQuit",

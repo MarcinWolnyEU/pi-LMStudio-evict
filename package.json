@@ -47,8 +47,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test --test-concurrency=1 --test-reporter=spec \"tests/**/*.test.ts\"",
-    "test:unit": "node --test --test-concurrency=1 --test-reporter=spec \"tests/unit/*.test.ts\"",
+    "test": "node --test --experimental-test-module-mocks --test-concurrency=1 --test-reporter=spec \"tests/**/*.test.ts\"",
+    "test:unit": "node --test --experimental-test-module-mocks --test-concurrency=1 --test-reporter=spec \"tests/unit/*.test.ts\"",
     "test:integration": "node --test --test-concurrency=1 --test-reporter=spec \"tests/integration/*.test.ts\"",
     "typecheck": "node tests/typecheck.mjs"
   }
