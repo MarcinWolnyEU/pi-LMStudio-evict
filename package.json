@@ -1,6 +1,6 @@
 {
   "name": "pi-lmstudio-evict",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "Pi extension for LM Studio: Conveniently manage your models directly from Pi Coding Agent. Prewarm, switch and evict models with ease.",
   "keywords": [
