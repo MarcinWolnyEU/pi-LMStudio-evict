@@ -32,10 +32,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         node:
-          - { version: "22.19.0", label: "22.19.0 (floor)" }
-          - { version: "lts/*", label: "lts" }
+          - { version: "22.19.0", label: "22.19.0 (floor)", slug: floor }
+          - { version: "lts/*", label: "lts", slug: lts }
           # setup-node reads "node" as the latest release.
-          - { version: "node", label: "latest" }
+          - { version: "node", label: "latest", slug: latest }
         include:
           - { os: ubuntu-latest, os-name: ubuntu }
           - { os: windows-latest, os-name: windows }
@@ -45,9 +45,9 @@ jobs:
         shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node.version }}
 
@@ -84,24 +84,26 @@ jobs:
 
       - name: Restore model cache
         id: models-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ~/.lmstudio/models
           key: lmstudio-models-${{ runner.os }}-${{ runner.arch }}-${{ env.LMS_MODELS_CACHE_KEY }}
 
+      # llmster rewrites ~/.lmstudio/bin/lms while it starts, so exec'ing lms
+      # right after `daemon up` can fail with ETXTBSY. The script waits for the
+      # file to settle; see its header. The watcher keeps logging changes to the
+      # binary and the daemon's pids for the rest of the job.
       - name: Start LM Studio
         run: |
-          lms --version
-          lms daemon up
-          lms server start
-          lms server status --json
+          node .github/scripts/lmstudio-watch.mjs "$RUNNER_TEMP/lmstudio-watch.log" > /dev/null 2>&1 < /dev/null &
+          .github/scripts/lmstudio-start.sh
 
       - name: Download models
         run: .github/scripts/lmstudio-models.sh $LMS_MODELS
 
       - name: Save model cache
         if: steps.models-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ~/.lmstudio/models
           key: ${{ steps.models-cache.outputs.cache-primary-key }}
@@ -127,8 +129,33 @@ jobs:
         if: always() && hashFiles('test.log') != ''
         run: .github/scripts/check-test-summary.sh test.log
 
-      - name: LM Studio server log
+      # The server log can run to thousands of lines and the failure window is
+      # rarely in the last 200, so keep all of it as an artifact.
+      - name: Collect LM Studio logs
         if: failure()
         run: |
-          lms ps || true
+          out="$RUNNER_TEMP/lmstudio-diag"
+          mkdir -p "$out"
+          cp -R ~/.lmstudio/server-logs "$out/" 2>/dev/null || true
+          cp test.log "$out/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/lmstudio-watch.log" "$out/" 2>/dev/null || true
+          {
+            date -u
+            lms --version
+            lms ps
+            lms server status
+            ls -la ~/.lmstudio/bin
+          } > "$out/state.txt" 2>&1 || true
+          cat "$out/state.txt"
+          tail -n 40 "$out/lmstudio-watch.log" 2>/dev/null || true
           tail -n 200 ~/.lmstudio/server-logs/*/*.log 2>/dev/null || true
+
+      - name: Upload LM Studio logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lmstudio-logs-${{ matrix.os-name }}-${{ matrix.node.slug }}
+          path: ${{ runner.temp }}/lmstudio-diag
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
