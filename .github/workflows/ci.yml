@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # pi is a peer dependency; the multi-session and extension-load tests need it.
+  PI_VERSION: 1.4.0
+  # The two chat models the integration suite loads. It picks the two smallest
+  # from `lms ls`, so nothing else chat-shaped may sit in the cache.
+  LMS_MODELS: google/gemma-3-270m liquid/lfm2-350m
+  LMS_MODELS_CACHE_KEY: gemma-3-270m+lfm2-350m-v1
+  # Opt in to estimate-guardrails.test.ts. A run with any skip is a failure.
+  PI_LMSTUDIO_EVICT_TEST_GUARDRAILS: "1"
+
+jobs:
+  test:
+    name: ${{ matrix.os-name }} / node ${{ matrix.node.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node:
+          - { version: "22.19.0", label: "22.19.0 (floor)" }
+          - { version: "lts/*", label: "lts" }
+          # setup-node reads "node" as the latest release.
+          - { version: "node", label: "latest" }
+        include:
+          - { os: ubuntu-latest, os-name: ubuntu }
+          - { os: windows-latest, os-name: windows }
+          - { os: macos-latest, os-name: macos }
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node.version }}
+
+      - name: Show versions
+        run: |
+          node -v
+          npm -v
+
+      - name: Install pi
+        run: npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}"
+
+      # --- LM Studio (llmster, the headless daemon) ---------------------------
+      - name: Install llmster (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libatomic1 libgomp1
+          curl -fsSL https://lmstudio.ai/install.sh | LMS_PRINT_QUIET=1 bash
+          echo "$HOME/.lmstudio/bin" >> "$GITHUB_PATH"
+
+      - name: Install llmster (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl -fsSL https://lmstudio.ai/install.sh | LMS_PRINT_QUIET=1 bash
+          echo "$HOME/.lmstudio/bin" >> "$GITHUB_PATH"
+
+      - name: Install llmster (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:LMS_PRINT_QUIET = "1"
+          irm https://lmstudio.ai/install.ps1 | iex
+          "$env:USERPROFILE\.lmstudio\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Restore model cache
+        id: models-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.lmstudio/models
+          key: lmstudio-models-${{ runner.os }}-${{ runner.arch }}-${{ env.LMS_MODELS_CACHE_KEY }}
+
+      - name: Start LM Studio
+        run: |
+          lms --version
+          lms daemon up
+          lms server start
+          lms server status --json
+
+      - name: Download models
+        run: .github/scripts/lmstudio-models.sh $LMS_MODELS
+
+      - name: Save model cache
+        if: steps.models-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.lmstudio/models
+          key: ${{ steps.models-cache.outputs.cache-primary-key }}
+
+      - name: Show LM Studio state
+        run: |
+          lms ls
+          lms ps
+          lms runtime ls || true
+
+      # --- Checks -------------------------------------------------------------
+      - name: Typecheck
+        run: npx -y -p typescript@5.9.3 node tests/typecheck.mjs
+
+      - name: Test (unit + integration, guardrails on)
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee test.log
+
+      # npm test only fails on failed tests. Skipped and cancelled tests would
+      # otherwise pass silently, so read the reporter's summary.
+      - name: Require zero skipped / cancelled tests
+        if: always() && hashFiles('test.log') != ''
+        run: .github/scripts/check-test-summary.sh test.log
+
+      - name: LM Studio server log
+        if: failure()
+        run: |
+          lms ps || true
+          tail -n 200 ~/.lmstudio/server-logs/*/*.log 2>/dev/null || true
