@@ -161,7 +161,9 @@ export function saveConfig(config: EvictConfig): void {
  * `lms load` flags the extension owns, mapped to whether they take a value.
  * A user copy would fight the extension's own: a second `--context-length`
  * defeats the wrong-context check, `--identifier` breaks residency matching
- * (and with it the `key:2` duplicate guard), `--estimate-only` loads nothing.
+ * (and with it the `key:2` duplicate guard), `--estimate-only` loads nothing,
+ * `--host`/`--port` (in `lms` builds that have them) would load on another
+ * LM Studio while `lms ps` and `unload` still talk to this one.
  */
 const OWNED_FLAGS: ReadonlyMap<string, boolean> = new Map([
 	["--yes", false],
@@ -171,6 +173,8 @@ const OWNED_FLAGS: ReadonlyMap<string, boolean> = new Map([
 	["--context-length", true],
 	["-c", true],
 	["--identifier", true],
+	["--host", true],
+	["--port", true],
 ]);
 
 /**

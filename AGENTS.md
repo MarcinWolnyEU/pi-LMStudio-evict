@@ -54,7 +54,7 @@ There is no build step; pi loads `.ts` directly via jiti. There are no `node_mod
 
 | Event | What happens |
 |---|---|
-| `session_start` | Prune dead claims, write this session's claim, `ensureServer` (when on an LM Studio model); on `reason: "startup"` only, `evictThenPreload` in a floating task — pi 1.4 emits **no** `model_select` for the model a process starts on (`--model` or the settings default; verified with a probe extension in print mode); reconcile `models.json`, `modelRegistry.refresh()` |
+| `session_start` | Prune dead claims, write this session's claim, `ensureServer` (when on an LM Studio model); on `reason: "startup"` only (which pi 1.4 also uses for `pi -c` / `--resume` on the command line — only the in-app `/resume` says `resume`), `evictThenPreload` in a floating task — pi 1.4 emits **no** `model_select` for the model a process starts on (`--model` or the settings default; verified with a probe extension in print mode); reconcile `models.json`, `modelRegistry.refresh()` |
 | `model_select` | Update the claim; unless restore / same-model / mid-stream, run `ensureServer` then `evictThenPreload` in a floating task |
 | `before_agent_start` | Past the residency cache: `ensureServer`, then heal — if the active model is not resident at the wanted context, (unload and) reload it **before** the turn proceeds |
 | `session_shutdown` | Drop this session's claim; on `reason: "quit"` only, `releaseOnQuit` |
@@ -73,15 +73,15 @@ Both take the cross-process lock, and both are exported so the integration tests
 Two smaller sequences, both opt-in and both under the lock with a short `timeoutMs` (the body runs anyway past it):
 
 - `ensureServer()` — `lms server start` when `startServer` is on and `lms server status` says it is down; re-checks inside the lock. `lms ps`/`load` work without the server, pi's requests do not.
-- `releaseOnQuit()` — on a real quit, unload this session's model unless another live session claims it (`unloadOnQuit`), and stop the server if no other pi session is alive (`stopServerOnQuit`). Not on `/new`, `/resume`, `/fork` or reload: the process carries on and would only load the model again.
+- `releaseOnQuit()` — on a real quit, unload this session's model unless another live session claims it (`unloadOnQuit`), and stop the server if no other pi session is alive (`stopServerOnQuit`). Not on `/new`, `/resume`, `/fork` or reload: the process carries on and would only load the model again. pi awaits the shutdown handler, so it is capped at `QUIT_BUDGET_MS` (10 s); a stuck LM Studio cannot hold the quit.
 
 ### Context length
 
 `contextLengthFor(modelKey, config)` (config.ts) decides the `--context-length`: a hand-written `contextWindow` under any `lmstudio*` provider in `models.json` (when `matchContextWindow`), then `contextLength`, else none. Generated entries are skipped on purpose — `toModelEntry` writes the model's *maximum* context there, and loading a 262k window blindly can exhaust memory. `loadArgs` takes the value as a parameter so it stays pure; the orchestrator resolves it.
 
-`hasWrongContext()` decides whether a resident copy must be replaced. It refuses to judge a copy whose `lastUsedTime` is null, because that copy may still be loading (see the measurement below), and unloading it would cut the load off.
+`hasWrongContext()` decides whether a resident copy must be replaced. It refuses to judge a copy whose `lastUsedTime` is null, because that copy may still be loading (see the measurement below), and unloading it would cut the load off. A request above the model's `maxContextLength` counts as met at either value: 0.4.25 accepts `-c 200000` on a 131072-max model and reports 200000 (measured), but a build that capped it would otherwise look wrong forever. A wrong-context reload that fails is remembered for the process, keyed by its exact `lms load` arguments, and not retried: unloading a working just-in-time copy only to fail again would repeat every turn. Changing the config changes the key, so a fix is tried.
 
-`extraArgsFor()` appends `extraLoadArgs` and `modelLoadArgs[key]`, minus the flags the extension owns (`OWNED_FLAGS`): a user `--context-length` would defeat `hasWrongContext`, `--identifier` would break `matchesModelKey` and with it the `key:2` guard.
+`extraArgsFor()` appends `extraLoadArgs` and `modelLoadArgs[key]`, minus the flags the extension owns (`OWNED_FLAGS`): a user `--context-length` would defeat `hasWrongContext`, `--identifier` would break `matchesModelKey` and with it the `key:2` guard, and `--host`/`--port` (where a build has them) would load on another LM Studio than the one `lms ps` reads.
 
 ### Configuration
 
@@ -248,7 +248,7 @@ Honoured only when the owning PID is alive and `updatedAt` is within `CLAIM_STAL
 
 ## Tests
 
-`npm test`, or `test:unit` / `test:integration`. Node's built-in runner and type stripping — needs Node 22.18+ / 24+, no dependencies. `--test-concurrency=1` is essential: the integration tests share one LM Studio. A full green run is **109 passing, 1 skipped** (110 tests) (~3–7 minutes, most of it real model loads).
+`npm test`, or `test:unit` / `test:integration`. Node's built-in runner and type stripping — needs Node 22.18+ / 24+, no dependencies. `--test-concurrency=1` is essential: the integration tests share one LM Studio. A full green run is **112 passing, 1 skipped** (113 tests) (~3–7 minutes, most of it real model loads).
 
 **Known flake, cause identified: another client on the same LM Studio.** `multi-session.test.ts` › "heal fires through the real entry point…" passed in isolation and in file-only runs, but failed in three of five runs made while other agents were using the machine's LM Studio. The failures differed each time (a stray extra model and a duplicate `google/…` instance right after the load, a 237 s load instead of ~10 s, a model that reappeared during the 16 s cache-expiry sleep with no heal notification). The cause was another agent loading and unloading models that the test could not see; the test assumes nothing else touches LM Studio. If it fails, rerun it alone with `--test-name-pattern="heal fires"` with every other pi/LM Studio client closed before suspecting the lock; a persistent failure in that state is a real bug.
 

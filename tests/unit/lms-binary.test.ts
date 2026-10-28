@@ -52,6 +52,17 @@ test("lmsBinary: PATH wins over the install dir, and LMS_PATH wins over both", (
 	assert.equal(resolveIn({ ...env, LMS_PATH: explicit }), explicit);
 });
 
+test("lmsBinary: skips a directory named lms on PATH", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "lms-dir-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const home = path.join(root, "home");
+	const expected = fakeLms(path.join(home, ".lmstudio", "bin"));
+	// A directory is "executable" to accessSync(X_OK); spawning it is EACCES.
+	fs.mkdirSync(path.join(root, "path", EXE), { recursive: true });
+
+	assert.equal(resolveIn({ HOME: home, USERPROFILE: home, PATH: path.join(root, "path") }), expected);
+});
+
 test("lmsBinary: falls back to the bare name when nothing is found", (t) => {
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "lms-none-"));
 	t.after(() => fs.rmSync(home, { recursive: true, force: true }));

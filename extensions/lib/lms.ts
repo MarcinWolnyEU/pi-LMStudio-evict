@@ -96,8 +96,9 @@ export function lmsBinary(): string {
 	const found = candidates.find((candidate) => {
 		if (!candidate) return false;
 		try {
+			// A directory passes the X_OK check too (`~/bin/lms/` on PATH).
 			fs.accessSync(candidate, fs.constants.X_OK);
-			return true;
+			return fs.statSync(candidate).isFile();
 		} catch {
 			return false;
 		}
