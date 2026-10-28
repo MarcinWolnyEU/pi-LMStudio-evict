@@ -37,7 +37,7 @@ import * as path from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { saveConfig } from "../../extensions/lib/config.ts";
-import { unloadAll } from "../../extensions/lib/lms.ts";
+import { lmsRun, unloadAll } from "../../extensions/lib/lms.ts";
 import { sessionsDir } from "../../extensions/lib/sessions.ts";
 import { resetBarriers, signal } from "../support/barrier.ts";
 import { analyse } from "../support/event-log.ts";
@@ -450,13 +450,39 @@ test(
 );
 
 test(
-	"startup on a model (pi --model) evicts the others and preloads it; resume does not",
+	"preloadOnStartup off (the default): starting on a model evicts and loads nothing",
 	{ timeout: LONG_TIMEOUT_MS },
 	async (t) => {
 		if (!findJitiEntry()) return t.skip("pi not installed");
 		const { small } = await preflight();
 		const [x, y] = [small[0].modelKey, small[1].modelKey];
 		await resetLmStudio();
+		saveConfig({});
+		// Something another app loaded; a default startup must leave it alone.
+		assert.ok(await lmsRun(["load", x, "--yes"]), "setup load failed");
+		const ws = workspace();
+		t.after(() => releaseAll(ws));
+
+		const report = await timed(t, `start on ${y} with ${x} resident, default config`, () =>
+			runChild("A", ws, [{ op: "session_start", model: y }, { op: "session_shutdown" }]),
+		);
+		assert.equal(report.error, undefined);
+		assert.equal(report.timeline?.[0].settled, "no-op", "no preload should have started");
+		assert.deepEqual(await residentKeys(), [x], `${x} should be untouched and ${y} not loaded`);
+	},
+);
+
+test(
+	"preloadOnStartup on: startup on a model (pi --model) evicts the others and preloads it; resume does not",
+	{ timeout: LONG_TIMEOUT_MS },
+	async (t) => {
+		if (!findJitiEntry()) return t.skip("pi not installed");
+		const { small } = await preflight();
+		const [x, y] = [small[0].modelKey, small[1].modelKey];
+		await resetLmStudio();
+		// Children share this agent dir, so they read the same config.
+		saveConfig({ preloadOnStartup: true });
+		t.after(() => saveConfig({}));
 		const ws = workspace();
 		t.after(() => releaseAll(ws));
 

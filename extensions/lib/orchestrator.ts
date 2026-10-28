@@ -96,10 +96,55 @@ export function isResident(loaded: LoadedModel[], modelKey: string): boolean {
  * it would otherwise look wrong forever, and be reloaded on every turn.
  */
 export function hasWrongContext(entry: LoadedModel, contextLength: number | undefined): boolean {
-	if (contextLength === undefined || entry.contextLength === undefined) return false;
 	if (entry.lastUsedTime == null) return false;
+	return missesContext(entry, contextLength);
+}
+
+/**
+ * Does this copy report a context other than the one requested? The same
+ * max-context rule as `hasWrongContext`, without its `lastUsedTime` gate: use
+ * it once our own `lms load` has returned, when the load is complete and the
+ * reported context is real.
+ */
+function missesContext(entry: LoadedModel, contextLength: number | undefined): boolean {
+	if (contextLength === undefined || entry.contextLength === undefined) return false;
 	if (entry.contextLength === contextLength) return false;
 	return !(entry.maxContextLength && entry.contextLength === Math.min(contextLength, entry.maxContextLength));
+}
+
+/** A load that exited 0 but left the model at another context than requested. */
+export interface ContextMismatch {
+	requested: number;
+	actual: number;
+}
+
+/**
+ * Look again after a load of `modelKey` at `requested` tokens and report a
+ * mismatch. `lms load` exiting 0 does not mean the context was honoured: a
+ * flag combination the extension did not strip (`-yc2048`), a fractional
+ * value, or an LM Studio build that adjusts it all end here. Undefined when
+ * the copy matches or nothing can be told.
+ */
+async function checkContext(modelKey: string, requested: number | undefined): Promise<ContextMismatch | undefined> {
+	if (requested === undefined) return undefined;
+	const copies = ((await listLoaded()) ?? []).filter((entry) => matchesModelKey(entry, modelKey));
+	if (copies.length === 0 || copies.some((entry) => !missesContext(entry, requested))) return undefined;
+	const actual = copies[0].contextLength;
+	return actual === undefined ? undefined : { requested, actual };
+}
+
+/**
+ * Is another client using this copy right now? `status` is "idle" for a
+ * ready model and moves through "processingPrompt" and "generating" during a
+ * request; `queued` counts requests waiting behind its `parallel` limit.
+ * Unloading a busy copy cuts the stream off within about a second.
+ *
+ * The `lastUsedTime` gate in `hasWrongContext` happens to cover this on LM
+ * Studio 0.4.x (it is null for the whole request), but not on a build that
+ * leaves it set, so the status is checked on its own.
+ */
+export function isBusy(entry: LoadedModel): boolean {
+	return (entry.status !== undefined && entry.status !== "idle") || (entry.queued ?? 0) > 0;
 }
 
 /** Is `modelKey` resident at a context we can use? */
@@ -123,7 +168,9 @@ export function isUsable(
  * With a `contextLength`, a target copy loaded at a different context is not
  * worth keeping: it goes, and the target is reloaded at the right size. The
  * unload has to come first for the same `key:2` reason. A copy another
- * session has claimed is kept as it is — that session is using it.
+ * session has claimed is kept as it is — that session is using it. So is one
+ * that is busy serving a request (another client, not necessarily a pi
+ * session): this switch leaves it, and a later one fixes it.
  */
 export function planEviction(
 	loaded: LoadedModel[],
@@ -141,6 +188,9 @@ export function planEviction(
 		const key = entry.modelKey ?? entry.identifier;
 		if (protectedKeys.has(key)) keepIdentifiers.add(entry.identifier);
 	}
+	for (const entry of targetInstances) {
+		if (isBusy(entry) && hasWrongContext(entry, contextLength)) keepIdentifiers.add(entry.identifier);
+	}
 
 	return {
 		keep: loaded.filter((entry) => keepIdentifiers.has(entry.identifier)),
@@ -156,33 +206,93 @@ export function planEviction(
  */
 const SERVER_LOCK_TIMEOUT_MS = 10_000;
 
+/**
+ * How many times `ensureServer` runs `lms server start` before giving up, and
+ * the pause between attempts. Each attempt has its own 60 s timeout (in
+ * lms.ts), so a server that never comes up costs a turn about three minutes
+ * at worst, not the single 120 s it used to.
+ */
+const SERVER_START_ATTEMPTS = 3;
+const SERVER_START_PAUSE_MS = 2_000;
+
 export interface ServerOptions {
 	config?: ResolvedConfig;
 	lock?: AcquireOptions;
+	/** Called before each `lms server start` attempt, numbered from 1. */
+	onAttempt?: (attempt: number, of: number) => void;
+	/** Pause between attempts. Defaults to 2 s; tests pass 0. */
+	pauseMs?: number;
 }
 
 /**
+ * What `ensureServer` found and did:
+ *
+ * - `off`: the `startServer` setting is off, nothing was checked.
+ * - `up`: the server was already running.
+ * - `started`: it was down and is running now. That includes an attempt that
+ *   failed or timed out but left the server up (a slow cold start).
+ * - `failed`: it is still down after every attempt.
+ */
+export type ServerOutcome = "off" | "up" | "started" | "failed";
+
+/**
  * Start LM Studio's local server if `startServer` is on and it is down.
- * Resolves true when this call started it, false when nothing was needed or
- * the start failed, and undefined when the setting is off.
+ * Makes up to three attempts and re-checks the status after each failed one,
+ * since a start that timed out may still have worked.
  *
  * `lms ps`, `lms load` and friends work without the server — they talk to
  * the LM Studio service — but pi's requests go over its HTTP API, so a
  * resident model behind a stopped server still fails every turn.
  */
-export async function ensureServer(options: ServerOptions = {}): Promise<boolean | undefined> {
+export async function ensureServer(options: ServerOptions = {}): Promise<ServerOutcome> {
 	const config = options.config ?? loadResolvedConfig();
-	if (!config.startServer) return undefined;
-	if ((await serverStatus())?.running) return false;
+	if (!config.startServer) return "off";
+	if ((await serverStatus())?.running) return "up";
 
 	return withLock(
-		async (): Promise<boolean> => {
+		async (): Promise<ServerOutcome> => {
 			// Re-check: another session may have started it while we queued.
-			if ((await serverStatus())?.running) return false;
-			return startServer();
+			if ((await serverStatus())?.running) return "up";
+			for (let attempt = 1; attempt <= SERVER_START_ATTEMPTS; attempt++) {
+				options.onAttempt?.(attempt, SERVER_START_ATTEMPTS);
+				if (await startServer()) return "started";
+				if ((await serverStatus())?.running) return "started";
+				if (attempt < SERVER_START_ATTEMPTS) {
+					await new Promise((resolve) => setTimeout(resolve, options.pauseMs ?? SERVER_START_PAUSE_MS));
+				}
+			}
+			return "failed";
 		},
 		{ timeoutMs: SERVER_LOCK_TIMEOUT_MS, ...options.lock },
 	);
+}
+
+/**
+ * How long a failed wrong-context fix is remembered. One temporary cause
+ * (memory still being freed, LM Studio busy) must not switch the fix off for
+ * the rest of the pi session; a permanent one costs one unload-and-fail per
+ * ten minutes instead of one per turn.
+ */
+export const RELOAD_RETRY_MS = 10 * 60_000;
+
+/**
+ * Wrong-context fixes that failed in this process, as the time of the failure,
+ * keyed by the exact `lms load` arguments. A changed config (another context,
+ * other extra flags) is a different key, so it is tried at once.
+ */
+const failedReloads = new Map<string, number>();
+
+function rememberFailedReload(attempt: string): void {
+	failedReloads.set(attempt, Date.now());
+}
+
+/** Did this exact load fail less than `RELOAD_RETRY_MS` ago? Forgets older failures. */
+function recentlyFailed(attempt: string): boolean {
+	const failedAt = failedReloads.get(attempt);
+	if (failedAt === undefined) return false;
+	if (Date.now() - failedAt < RELOAD_RETRY_MS) return true;
+	failedReloads.delete(attempt);
+	return false;
 }
 
 export type EvictPhase = "evicting" | "loading" | "done";
@@ -208,6 +318,17 @@ export interface EvictOutcome {
 	alreadyResident: boolean;
 	/** False when the `lms load` failed or was never run. */
 	loaded: boolean;
+	/**
+	 * True when an unload failed and a copy of the target is still resident,
+	 * so the load was skipped: loading would add a `key:2` beside it.
+	 */
+	unloadFailed?: boolean;
+	/**
+	 * Set when the load worked but the model came up at another context than
+	 * requested. Remembered like a failed load, so the next heal does not
+	 * unload and reload it again.
+	 */
+	contextMismatch?: ContextMismatch;
 	/**
 	 * True when the lock was taken from us mid-sequence and we declined to
 	 * unload anything. Rare, and the point of detecting it: another session
@@ -282,20 +403,37 @@ export async function evictThenPreload(options: EvictOptions): Promise<EvictOutc
 			};
 		}
 
+		let unloadFailed = false;
 		if (victims.length > 0 && keep.length === 0) {
 			// Nothing to preserve — one call is faster, and catches anything
 			// `lms ps` might not have listed.
 			if (await unloadAll()) unloaded.push(...victims.map((v) => v.identifier));
+			else unloadFailed = true;
 		} else {
 			for (const victim of victims) {
 				if (await unload(victim.identifier)) unloaded.push(victim.identifier);
+				else unloadFailed = true;
 			}
 		}
 
+		const args = loadArgs(modelKey, config, contextLength);
+		// A failed unload may have left a copy of the target (typically the
+		// wrong-context one). Loading beside it would make a `key:2`, so look
+		// again. Failing to unload some other model does not stop the load.
+		let blocked = false;
+		if (unloadFailed && !targetResident) {
+			const after = await listLoaded();
+			blocked = !after || isResident(after, modelKey);
+			if (blocked) rememberFailedReload(args.join(" "));
+		}
+
 		let loadedOk = false;
-		if (!targetResident) {
+		let contextMismatch: ContextMismatch | undefined;
+		if (!targetResident && !blocked) {
 			progress("loading", modelKey);
-			loadedOk = await lmsBackground(loadArgs(modelKey, config, contextLength));
+			loadedOk = await lmsBackground(args);
+			if (loadedOk) contextMismatch = await checkContext(modelKey, contextLength);
+			if (contextMismatch) rememberFailedReload(args.join(" "));
 		}
 
 		progress("done");
@@ -305,6 +443,8 @@ export async function evictThenPreload(options: EvictOptions): Promise<EvictOutc
 			spared: keep.map((entry) => entry.identifier),
 			alreadyResident: targetResident,
 			loaded: loadedOk,
+			...(blocked ? { unloadFailed: true } : {}),
+			...(contextMismatch ? { contextMismatch } : {}),
 			durationMs: Date.now() - started,
 		};
 	}, options.lock);
@@ -331,10 +471,28 @@ export interface HealOutcome {
 	 * stays false and the copy is left as it is).
 	 */
 	wrongContext?: boolean;
+	/**
+	 * True when a wrong-context copy was left alone because a request is running
+	 * on it (see `isBusy`). Nothing was unloaded or loaded; the next turn tries
+	 * again.
+	 */
+	busy?: boolean;
 	/** True when this call issued the reload (false if another session beat us). */
 	reloaded: boolean;
 	/** False when the reload was attempted and failed. */
 	ok: boolean;
+	/**
+	 * True when the wrong-context copy could not be unloaded and is still
+	 * resident. No load was issued (it would add a `key:2`); `ok` is false
+	 * and `reloaded` stays false.
+	 */
+	unloadFailed?: boolean;
+	/**
+	 * Set when the reload worked but the model came up at another context than
+	 * requested (`ok` stays true: it is loaded). Remembered like a failed
+	 * reload, so it is not unloaded and loaded again until the backoff ends.
+	 */
+	contextMismatch?: ContextMismatch;
 	durationMs: number;
 }
 
@@ -351,13 +509,6 @@ export interface HealOutcome {
  * wrong context length (typically a just-in-time load at LM Studio's small
  * default). Reloading without unloading first would leave a `key:2` copy.
  */
-/**
- * Wrong-context reloads that failed in this process, keyed by the exact
- * `lms load` arguments, so a fixed config (another context, other extra
- * flags) is tried again.
- */
-const failedReloads = new Set<string>();
-
 export async function healIfEvicted(options: HealOptions): Promise<HealOutcome> {
 	const started = Date.now();
 	const config = options.config ?? loadResolvedConfig();
@@ -391,12 +542,26 @@ export async function healIfEvicted(options: HealOptions): Promise<HealOutcome> 
 		const args = loadArgs(modelKey, config, contextLength);
 		const attempt = args.join(" ");
 		if (wrongContext) {
+			// Someone is mid-request on it: unloading cuts their stream. The check
+			// is as fresh as the listing above; a request that starts in the gap
+			// before the unload is not covered.
+			if (stale.some(isBusy)) {
+				return {
+					checked: true,
+					wasEvicted: false,
+					wrongContext,
+					busy: true,
+					reloaded: false,
+					ok: true,
+					durationMs: Date.now() - started,
+				};
+			}
 			const claimed = config.multiSessionSafety ? claimedByOthers(sessionId) : new Set<string>();
 			// Another session is using this copy as it is, or the lock was taken
 			// from us: unloading now could cut off a response. Leave it. Same
-			// when this exact load already failed: unloading a working copy
+			// when this exact load failed recently: unloading a working copy
 			// only to fail again would repeat on every turn.
-			if (claimed.has(modelKey) || (handle && !handle.isValid()) || failedReloads.has(attempt)) {
+			if (claimed.has(modelKey) || (handle && !handle.isValid()) || recentlyFailed(attempt)) {
 				return {
 					checked: true,
 					wasEvicted: false,
@@ -406,7 +571,28 @@ export async function healIfEvicted(options: HealOptions): Promise<HealOutcome> 
 					durationMs: Date.now() - started,
 				};
 			}
-			for (const entry of stale) await unload(entry.identifier);
+			let unloadFailed = false;
+			for (const entry of stale) {
+				if (!(await unload(entry.identifier))) unloadFailed = true;
+			}
+			if (unloadFailed) {
+				// A copy that is still there makes a load add a `key:2`. Go on only
+				// if none is left; if `lms ps` cannot say, assume one is.
+				const after = await listLoaded();
+				if (!after || isResident(after, modelKey)) {
+					rememberFailedReload(attempt);
+					progress("done");
+					return {
+						checked: true,
+						wasEvicted: false,
+						wrongContext,
+						reloaded: false,
+						ok: false,
+						unloadFailed: true,
+						durationMs: Date.now() - started,
+					};
+				}
+			}
 		}
 
 		progress("loading");
@@ -414,8 +600,12 @@ export async function healIfEvicted(options: HealOptions): Promise<HealOutcome> 
 		// result: the turn is being held open for it. Without it the host can
 		// exit the instant its event loop empties, mid-load.
 		const ok = await lmsBackground(args, { keepAlive: true });
-		if (ok) failedReloads.delete(attempt);
-		else if (wrongContext) failedReloads.add(attempt);
+		let contextMismatch: ContextMismatch | undefined;
+		if (ok) {
+			failedReloads.delete(attempt);
+			contextMismatch = await checkContext(modelKey, contextLength);
+			if (contextMismatch) rememberFailedReload(attempt);
+		} else if (wrongContext) rememberFailedReload(attempt);
 		progress("done");
 		return {
 			checked: true,
@@ -423,6 +613,7 @@ export async function healIfEvicted(options: HealOptions): Promise<HealOutcome> 
 			wrongContext,
 			reloaded: true,
 			ok,
+			...(contextMismatch ? { contextMismatch } : {}),
 			durationMs: Date.now() - started,
 		};
 	}, options.lock);

@@ -13,7 +13,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { contextLengthFor, extraArgsFor, loadArgs } from "../../extensions/lib/config.ts";
+import {
+	argList,
+	contextLengthFor,
+	extraArgsFor,
+	formatArgs,
+	loadArgs,
+	tokenizeArgs,
+} from "../../extensions/lib/config.ts";
 import { type LoadedModel, parseEstimate, parseSizeBytes } from "../../extensions/lib/lms.ts";
 import { fitOf, formatBytes } from "../../extensions/lib/memory.ts";
 import {
@@ -273,6 +280,13 @@ test("loadArgs: always scripts non-interactively, and only sets a TTL when confi
 	assert.deepEqual(loadArgs("alpha", { ttlSeconds: 12.7 }), ["load", "alpha", "--yes", "--ttl", "12"]);
 });
 
+test("loadArgs: a fractional context length below 1 is not a context length", () => {
+	assert.deepEqual(loadArgs("alpha", {}, 0.5), ["load", "alpha", "--yes"]);
+	assert.deepEqual(loadArgs("alpha", {}, 1.9), ["load", "alpha", "--yes", "--context-length", "1"]);
+	assert.equal(contextLengthFor("alpha", { contextLength: 0.5 }, "unused.json"), undefined);
+	assert.equal(contextLengthFor("alpha", { contextLength: 4096.9 }, "unused.json"), 4096);
+});
+
 test("loadArgs: passes a context length only when it is a positive number", () => {
 	assert.deepEqual(loadArgs("alpha", {}, 32768), ["load", "alpha", "--yes", "--context-length", "32768"]);
 	assert.deepEqual(loadArgs("alpha", { ttlSeconds: 900 }, 32768), [
@@ -359,9 +373,109 @@ test("extraArgsFor: drops flags the extension owns, with their values", () => {
 	assert.deepEqual(extraArgsFor("alpha", config), ["--gpu", "0.5", "--parallel", "4"]);
 });
 
+test("extraArgsFor: reads combined short flags the way commander does", () => {
+	const dropped = (...args: string[]) => extraArgsFor("alpha", { extraLoadArgs: args });
+	// -yc2048 is -y -c 2048: the second context length would win over ours.
+	assert.deepEqual(dropped("--gpu", "max", "-yc2048", "--parallel", "2"), ["--gpu", "max", "--parallel", "2"]);
+	assert.deepEqual(dropped("-cy"), [], "the value is attached, so nothing else is dropped");
+	assert.deepEqual(dropped("-yc", "2048", "--gpu", "max"), ["--gpu", "max"], "the value is the next arg");
+	assert.deepEqual(dropped("-yc", "--gpu", "max"), ["max"], "-c takes the next arg whatever it is");
+	assert.deepEqual(dropped("-yy", "--gpu", "max"), ["--gpu", "max"], "a combined flag with no value");
+	assert.deepEqual(dropped("-c4096", "--gpu", "max"), ["--gpu", "max"]);
+	// Values and unrelated flags are left alone.
+	assert.deepEqual(dropped("--gpu", "max", "--gpu", "0.5", "--parallel", "2"), [
+		"--gpu", "max", "--gpu", "0.5", "--parallel", "2",
+	]);
+	assert.deepEqual(dropped("--offset", "-1", "--ratio", "-0.5", "-"), ["--offset", "-1", "--ratio", "-0.5", "-"]);
+	assert.deepEqual(dropped("-g", "max", "-p4"), ["-g", "max", "-p4"]);
+});
+
+test("extraArgsFor: drops --auto only when a context length is passed", () => {
+	const config = { extraLoadArgs: ["--auto", "--gpu", "max"], modelLoadArgs: { alpha: ["--auto"] } };
+	assert.deepEqual(extraArgsFor("alpha", config), ["--auto", "--gpu", "max", "--auto"]);
+	assert.deepEqual(extraArgsFor("alpha", config, true), ["--gpu", "max"]);
+});
+
 test("extraArgsFor: tolerates hand-edited junk", () => {
-	const config = { extraLoadArgs: "--gpu max", modelLoadArgs: { alpha: [42, "", "--parallel", "2"] } } as never;
+	const config = { extraLoadArgs: 42, modelLoadArgs: { alpha: [42, "", "--parallel", "2"], beta: 7 } } as never;
 	assert.deepEqual(extraArgsFor("alpha", config), ["--parallel", "2"]);
+	assert.deepEqual(extraArgsFor("beta", config), []);
+	assert.deepEqual(extraArgsFor("constructor", config), []);
+});
+
+// Backslashes are ordinary characters in flag strings, so keep them raw here.
+const WIN_PATH = String.raw`C:\Users\John Doe\cfg.json`;
+
+test("extraArgsFor: a string in config.json is tokenized, for both global and per-model flags", () => {
+	const config = {
+		extraLoadArgs: `--gpu max --engine-config-file "${WIN_PATH}"`,
+		modelLoadArgs: { alpha: "--parallel 2 -c 4096" },
+	};
+	assert.deepEqual(extraArgsFor("alpha", config), [
+		"--gpu",
+		"max",
+		"--engine-config-file",
+		WIN_PATH,
+		"--parallel",
+		"2",
+	]);
+	assert.deepEqual(argList("--gpu max"), ["--gpu", "max"]);
+	assert.deepEqual(argList(["--gpu", 1, "max"]), ["--gpu", "max"]);
+	assert.deepEqual(argList(undefined), []);
+});
+
+test("tokenizeArgs: quotes group and glue, backslashes are plain characters", () => {
+	assert.deepEqual(tokenizeArgs("--gpu max  --parallel\t2 "), ["--gpu", "max", "--parallel", "2"]);
+	assert.deepEqual(tokenizeArgs(`--engine-config-file "${WIN_PATH}"`), ["--engine-config-file", WIN_PATH]);
+	assert.deepEqual(tokenizeArgs(String.raw`--engine-config-file C:\no\spaces.json`), [
+		"--engine-config-file",
+		String.raw`C:\no\spaces.json`,
+	]);
+	assert.deepEqual(tokenizeArgs("--name 'a b' --other"), ["--name", "a b", "--other"]);
+	assert.deepEqual(tokenizeArgs('--flag="a b"'), ["--flag=a b"]);
+	assert.deepEqual(tokenizeArgs(`x"a b"y'c d'z`), ["xa byc dz"]);
+	assert.deepEqual(tokenizeArgs(`"it's" 'say "hi"'`), ["it's", 'say "hi"']);
+	assert.deepEqual(tokenizeArgs('--a "" --b'), ["--a", "", "--b"], "an empty quoted token is kept");
+	assert.deepEqual(tokenizeArgs('--a "unterminated value'), ["--a", "unterminated value"]);
+	assert.deepEqual(tokenizeArgs(""), []);
+	assert.deepEqual(tokenizeArgs("  \t "), []);
+});
+
+test("formatArgs: quotes what needs it, and round-trips through tokenizeArgs", () => {
+	assert.equal(formatArgs([]), "");
+	assert.equal(formatArgs(["--gpu", "max", "--ratio", "0.5", "-1"]), "--gpu max --ratio 0.5 -1");
+	assert.equal(
+		formatArgs(["--engine-config-file", WIN_PATH]),
+		`--engine-config-file "${WIN_PATH}"`,
+	);
+	const awkward = [
+		"--flag=a b",
+		WIN_PATH,
+		"it's",
+		'say "hi"',
+		`both ' and "`,
+		"",
+		"tab\tseparated",
+		"plain",
+	];
+	assert.deepEqual(tokenizeArgs(formatArgs(awkward)), awkward);
+	assert.deepEqual(tokenizeArgs(formatArgs(["--gpu", "max"])), ["--gpu", "max"]);
+});
+
+test("loadArgs: --auto passes through without a context length and is dropped with one", () => {
+	const config = { extraLoadArgs: ["--auto", "--gpu", "max"] };
+	assert.deepEqual(loadArgs("alpha", config), ["load", "alpha", "--yes", "--auto", "--gpu", "max"]);
+	assert.deepEqual(loadArgs("alpha", config, 4096), [
+		"load",
+		"alpha",
+		"--yes",
+		"--context-length",
+		"4096",
+		"--gpu",
+		"max",
+	]);
+	// A context length that does not survive tokens() is not passed, so --auto stays.
+	assert.deepEqual(loadArgs("alpha", config, 0), ["load", "alpha", "--yes", "--auto", "--gpu", "max"]);
 });
 
 test("loadArgs: extra flags go last, after the ones the extension sets", () => {

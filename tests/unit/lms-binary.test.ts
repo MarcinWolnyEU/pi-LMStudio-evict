@@ -10,13 +10,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
+import { pathToFileURL } from "node:url";
 
 const LMS_MODULE = path.resolve(import.meta.dirname, "../../extensions/lib/lms.ts");
 const EXE = process.platform === "win32" ? "lms.exe" : "lms";
 
 /** Resolve `lmsBinary()` in a child with exactly this environment. */
 function resolveIn(env: Record<string, string>): string {
-	const script = `import(${JSON.stringify(LMS_MODULE)}).then((m) => process.stdout.write(m.lmsBinary()))`;
+	// An absolute Windows path is not a valid ESM specifier (the drive letter reads as a
+	// URL scheme), so it must be a file: URL.
+	const script = `import(${JSON.stringify(pathToFileURL(LMS_MODULE).href)}).then((m) => process.stdout.write(m.lmsBinary()))`;
 	return execFileSync(process.execPath, ["-e", script], { env, encoding: "utf-8" }).trim();
 }
 
